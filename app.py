@@ -1,86 +1,69 @@
 # app.py
+from __future__ import annotations
+
 import os
 import logging
-from datetime import timedelta
+from typing import Any, Dict
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from flask_talisman import Talisman
 from dotenv import load_dotenv
 
-import psycopg
-from psycopg.rows import dict_row
+# Carga variables del .env (local). En Render las obtiene del entorno.
+load_dotenv()
 
-# Carga .env
-load_dotenv(override=False)
+# -------- Blueprints (asegúrate de que estos archivos existen) --------
+from auth import bp_auth          # /api/login (JWT)
+from recepciones_api import bp_recepciones  # /api/orders, /api/receipts
 
-FLASK_ENV = os.getenv("FLASK_ENV", "production").lower()
-SECRET_KEY = os.getenv("SECRET_KEY", "changeme")
-CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
-DATABASE_URL = os.getenv("DATABASE_URL")
 
-app = Flask(__name__)
-app.secret_key = SECRET_KEY
-app.config.update(
-    SESSION_COOKIE_SECURE = (FLASK_ENV == "production"),
-    SESSION_COOKIE_HTTPONLY = True,
-    SESSION_COOKIE_SAMESITE = "Lax",
-    PERMANENT_SESSION_LIFETIME = timedelta(minutes=30),
-    JSON_SORT_KEYS = False,
-)
+def create_app() -> Flask:
+    app = Flask(__name__)
 
-logging.basicConfig(level=logging.DEBUG if FLASK_ENV != "production" else logging.INFO)
-app.logger.setLevel(logging.DEBUG if FLASK_ENV != "production" else logging.INFO)
+    # --- Logging básico
+    logging.basicConfig(level=logging.INFO)
+    app.logger.setLevel(logging.INFO)
 
-csp = {
-    "default-src": ["'self'"],
-    "script-src":  ["'self'", "cdnjs.cloudflare.com"],
-    "style-src":   ["'self'", "'unsafe-inline'", "cdnjs.cloudflare.com", "fonts.googleapis.com"],
-    "font-src":    ["'self'", "fonts.gstatic.com"],
-    "img-src":     ["'self'", "data:"],
-}
-Talisman(
-    app,
-    content_security_policy=csp,
-    force_https=(FLASK_ENV == "production"),
-    strict_transport_security=(FLASK_ENV == "production"),
-)
+    # --- Secret key (para sesiones/firmas si algún día usas server-side sessions)
+    secret = os.getenv("SECRET_KEY")
+    if not secret:
+        app.logger.warning("SECRET_KEY no está definido; defínelo en .env / Render.")
+    app.config["SECRET_KEY"] = secret or "dev-not-secure"
 
-if CORS_ORIGINS:
-    CORS(app, origins=CORS_ORIGINS, supports_credentials=True)
-else:
-    CORS(app)
+    # --- CORS
+    #  - En dev: por defecto '*'
+    #  - En prod: pon CORS_ORIGINS="https://recepciones.bersacloud.app"
+    cors_origins = os.getenv("CORS_ORIGINS", "*")
+    CORS(app, resources={r"/api/*": {"origins": cors_origins}})
 
-def get_db_connection():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL no está configurado")
-    return psycopg.connect(DATABASE_URL)
+    # --- Rutas de salud
+    @app.get("/health")
+    def health():
+        return jsonify({"ok": True}), 200
 
-@app.get("/health")
-def health():
-    return jsonify({"status":"ok","env":FLASK_ENV,"service":"recepciones-api"}), 200
+    @app.get("/ping")
+    def ping():
+        return "pong", 200
 
-@app.get("/db/ping")
-def db_ping():
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SELECT 1 AS ok;")
-                row = cur.fetchone()
-                return jsonify({"db":"ok","result":row}), 200
-    except Exception as e:
-        app.logger.exception("DB ping error")
-        return jsonify({"db":"error","message":str(e)}), 500
+    # --- Registro de blueprints
+    app.register_blueprint(bp_auth)
+    app.register_blueprint(bp_recepciones)
 
-@app.get("/")
-def root():
-    return jsonify({"message":"API Recepciones lista. Endpoints: /api/orders, /api/orders/<docEntry>, /api/receipts"}), 200
+    # --- Manejo homogéneo de errores no controlados (JSON)
+    @app.errorhandler(Exception)
+    def handle_unexpected(e: Exception):
+        app.logger.exception("Unhandled error: %s", e)
+        code = getattr(e, "code", 500) or 500
+        return jsonify({"error": {"code": "UNEXPECTED_ERROR", "message": str(e)}}), int(code)
 
-# --- registra el blueprint ---
-from recepciones_api import bp_recepciones
-app.register_blueprint(bp_recepciones)
+    return app
+
+
+# WSGI entrypoint
+app = create_app()
 
 if __name__ == "__main__":
-    host = os.getenv("FLASK_RUN_HOST", "127.0.0.1")
-    port = int(os.getenv("FLASK_RUN_PORT", "5000"))
-    app.run(host=host, port=port, debug=(FLASK_ENV != "production"))
+    # Ejecuta en dev; en Render se usa gunicorn con wsgi:app
+    port = int(os.getenv("PORT", "5000"))
+    debug = os.getenv("FLASK_DEBUG", "0") not in ("0", "false", "False")
+    app.run(host="0.0.0.0", port=port, debug=debug)

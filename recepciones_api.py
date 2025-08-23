@@ -7,11 +7,11 @@ from typing import Optional
 
 from flask import Blueprint, request, jsonify
 from pydantic import BaseModel, Field, ValidationError, conint, confloat
-
 import psycopg
 from psycopg.rows import dict_row
 
 from sap_client import SAPClient
+from auth import require_auth, user_can_access_whs
 
 bp_recepciones = Blueprint("recepciones_api", __name__)
 
@@ -20,15 +20,14 @@ if not DB_URL:
     raise RuntimeError("DATABASE_URL no está configurado")
 
 def get_db():
-    # Tu cadena Neon ya trae sslmode=require
     return psycopg.connect(DB_URL)
 
-# --------- Schemas ----------
+# ---------- Schemas ----------
 class OrdersQuery(BaseModel):
-    due_from: Optional[str] = None  # YYYY-MM-DD
+    due_from: Optional[str] = None
     due_to:   Optional[str] = None
     vendorCode: Optional[str] = None
-    whsCode:   Optional[str] = None  # usado para filtrar líneas en detalle (opcional)
+    whsCode:   Optional[str] = None
     page: conint(ge=1) = 1
     pageSize: conint(ge=1, le=100) = 20
 
@@ -39,27 +38,25 @@ class ReceiptLineIn(BaseModel):
 class ReceiptIn(BaseModel):
     docEntry: int
     whsCode: str
-    # Pydantic v2: usa list[...] + Field(min_length=1)
     lines: list[ReceiptLineIn] = Field(min_length=1)
     supplierRef: Optional[str] = None
 
-# --------- Helpers ----------
-def whoami() -> str:
-    # Mientras no tenemos auth, usa header opcional X-User o "api"
-    return (request.headers.get("X-User") or "api").strip() or "api"
-
+# ---------- Helpers ----------
 def op_hash(user: str, payload: dict) -> str:
-    # Idempotencia por día (ajusta si quieres otra ventana)
     raw = json.dumps({"user": user, **payload, "date": str(date.today())}, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-# --------- Endpoints ----------
+# ---------- Endpoints ----------
 @bp_recepciones.get("/api/orders")
+@require_auth
 def list_orders():
     try:
         q = OrdersQuery(**request.args.to_dict())
     except ValidationError as e:
         return jsonify({"error": {"code": "VALIDATION_ERROR", "message": str(e)}}), 400
+
+    if q.whsCode and not user_can_access_whs(q.whsCode):
+        return jsonify({"error": {"code": "FORBIDDEN", "message": f"No tienes acceso al almacén {q.whsCode}"}}), 403
 
     client = SAPClient()
     data = client.get_open_purchase_orders(
@@ -74,15 +71,18 @@ def list_orders():
             "vendorCode": it.get("CardCode"),
             "vendorName": it.get("CardName"),
             "docDueDate": it.get("DocDueDate"),
-            "openLines": None,       # cálculo fino en detalle
+            "openLines": None,
             "totalOpenQty": None
         })
     return jsonify({"page": q.page, "pageSize": q.pageSize, "total": len(out), "data": out}), 200
 
 @bp_recepciones.get("/api/orders/<int:doc_entry>")
+@require_auth
 def order_detail(doc_entry: int):
-    # Filtrado opcional por whsCode via query
     whs_filter = request.args.get("whsCode")
+    if whs_filter and not user_can_access_whs(whs_filter):
+        return jsonify({"error": {"code": "FORBIDDEN", "message": f"No tienes acceso al almacén {whs_filter}"}}), 403
+
     client = SAPClient()
     po = client.get_purchase_order(doc_entry)
     lines = []
@@ -108,18 +108,21 @@ def order_detail(doc_entry: int):
     }), 200
 
 @bp_recepciones.post("/api/receipts")
+@require_auth
 def post_receipt():
     try:
         payload = ReceiptIn(**request.get_json(force=True))
     except ValidationError as e:
         return jsonify({"error": {"code": "VALIDATION_ERROR", "message": str(e)}}), 400
 
-    user = whoami()
+    if not user_can_access_whs(payload.whsCode):
+        return jsonify({"error": {"code": "FORBIDDEN", "message": f"No tienes acceso al almacén {payload.whsCode}"}}), 403
 
-    # Revalida openQty en tiempo real contra SL
+    user = getattr(request, "_user", {})
+    username = user.get("sub") or user.get("username") or "api"
+
     client = SAPClient()
     po = client.get_purchase_order(payload.docEntry)
-    # Solo líneas del almacén indicado
     open_by_line = {
         int(ln["LineNum"]): float(ln["OpenQty"])
         for ln in po["Lines"] if ln["WarehouseCode"] == payload.whsCode
@@ -138,10 +141,8 @@ def post_receipt():
                 "details":{"lineNum": ln.lineNum, "quantity": ln.quantity, "openQty": open_by_line[ln.lineNum]}
             }}), 409
 
-    # Idempotencia por bloque (docEntry + líneas + whs + user + fecha)
-    oph = op_hash(user, payload.model_dump())
+    oph = op_hash(username, payload.model_dump())
 
-    # Verifica idempotencia y registra log tras crear GRPO
     with get_db() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT 1 FROM receipts_log WHERE op_hash=%s", (oph,))
         if cur.fetchone():
@@ -151,7 +152,6 @@ def post_receipt():
                 "details":{"opHash": oph}
             }}), 409
 
-        # Crear GRPO en SL
         sl = client.post_grpo(
             doc_entry=payload.docEntry,
             whs_code=payload.whsCode,
@@ -160,14 +160,13 @@ def post_receipt():
         )
         grpo_de = sl.get("DocEntry")
 
-        # Log por línea
         for l in payload.lines:
             cur.execute("""
                 INSERT INTO receipts_log
                   (po_doc_entry, po_line_num, item_code, whs_code, posted_qty, posted_by, sl_doc_entry, payload_json, op_hash, created_at)
                 VALUES
                   (%s, %s, NULL, %s, %s, %s, %s, %s::jsonb, %s, NOW())
-            """, (payload.docEntry, l.lineNum, payload.whsCode, l.quantity, user, grpo_de, json.dumps(sl), oph))
+            """, (payload.docEntry, l.lineNum, payload.whsCode, l.quantity, username, grpo_de, json.dumps(sl), oph))
         conn.commit()
 
     return jsonify({
