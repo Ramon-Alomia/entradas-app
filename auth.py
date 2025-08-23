@@ -18,8 +18,8 @@ DB_URL = os.getenv("DATABASE_URL")
 JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_ALG = "HS256"
 
-# Blueprint con prefijo /api
-bp_auth = Blueprint("auth", __name__, url_prefix="/api")
+# 🔵 Nombre interno ÚNICO para evitar colisiones
+bp_auth = Blueprint("auth_api", __name__, url_prefix="/api")
 
 # Hasher Argon2id
 ph = PasswordHasher()
@@ -37,26 +37,23 @@ def _make_token(payload: Dict[str, Any]) -> str:
         "role": payload["role"],
         "warehouses": payload["warehouses"],
         "iat": int(now.timestamp()),
-        # válido desde 60s antes para tolerar desfases de reloj
-        "nbf": int((now - dt.timedelta(seconds=60)).timestamp()),
+        "nbf": int((now - dt.timedelta(seconds=60)).timestamp()),  # tolerancia desfase reloj
         "exp": int((now + dt.timedelta(hours=8)).timestamp()),
         "iss": "recepciones-api",
     }
     return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALG)
 
 def decode_token(auth_header: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Devuelve el payload del JWT o None si no es válido."""
     if not auth_header or not auth_header.lower().startswith("bearer "):
         return None
     token = auth_header.split(" ", 1)[1].strip()
     try:
-        # Relajamos verificación de iat y añadimos leeway por desfase de reloj
         data = jwt.decode(
             token,
             JWT_SECRET,
             algorithms=[JWT_ALG],
             options={"verify_exp": True, "verify_nbf": True, "verify_iat": False},
-            leeway=120,  # 2 minutos de tolerancia
+            leeway=120,  # 2 min de tolerancia
         )
         return data
     except jwt.PyJWTError as e:
@@ -64,7 +61,6 @@ def decode_token(auth_header: Optional[str]) -> Optional[Dict[str, Any]]:
         return None
 
 def require_auth(fn):
-    """Decorator para exigir JWT en endpoints."""
     @wraps(fn)
     def wrapper(*args, **kwargs):
         if not JWT_SECRET:
@@ -77,7 +73,6 @@ def require_auth(fn):
     return wrapper
 
 def user_can_access_whs(whs: Optional[str]) -> bool:
-    """Valida que el almacén solicitado esté en el token del usuario."""
     if not whs:
         return True
     user = getattr(request, "_user", None) or decode_token(request.headers.get("Authorization"))
@@ -113,16 +108,15 @@ def login():
         except (VerifyMismatchError, InvalidHashError):
             return jsonify({"error": {"code": "INVALID_CREDENTIALS", "message": "Credenciales inválidas"}}), 401
 
-        # almacenes permitidos
         cur.execute("SELECT whscode FROM user_warehouses WHERE username=%s", (username,))
         whs = [r["whscode"] for r in cur.fetchall()]
 
     token = _make_token({"username": username, "role": u["role"], "warehouses": whs})
     return jsonify({"token": token, "username": username, "role": u["role"], "warehouses": whs}), 200
 
-# (Opcional) endpoint para saber quién soy
 @bp_auth.get("/me")
-@require_auth
 def me():
-    user = getattr(request, "_user", {})
+    user = decode_token(request.headers.get("Authorization"))
+    if not user:
+        return jsonify({"error": {"code": "UNAUTHORIZED", "message": "Token inválido o ausente"}}), 401
     return jsonify({"user": user}), 200
