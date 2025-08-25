@@ -1,176 +1,145 @@
 # recepciones_api.py
-import os
-import json
-import hashlib
-from datetime import date
-from typing import Optional
+from __future__ import annotations
+import os, hashlib, json, datetime as dt
+from typing import Optional, Dict, Any, List
 
-from flask import Blueprint, request, jsonify
-from pydantic import BaseModel, Field, ValidationError, conint, confloat
 import psycopg
 from psycopg.rows import dict_row
+from flask import Blueprint, request, jsonify
 
-from sap_client import SAPClient
-from auth import require_auth, user_can_access_whs
+from auth import require_auth, decode_token, user_can_access_whs
+from sap_client import SapClient
 
-bp_recepciones = Blueprint("recepciones_api", __name__)
+bp_recepciones = Blueprint("recepciones", __name__, url_prefix="/api")
 
 DB_URL = os.getenv("DATABASE_URL")
-if not DB_URL:
-    raise RuntimeError("DATABASE_URL no está configurado")
 
-def get_db():
+def _db():
+    if not DB_URL:
+        raise RuntimeError("DATABASE_URL no configurada")
     return psycopg.connect(DB_URL)
 
-# ---------- Schemas ----------
-class OrdersQuery(BaseModel):
-    due_from: Optional[str] = None
-    due_to:   Optional[str] = None
-    vendorCode: Optional[str] = None
-    whsCode:   Optional[str] = None
-    page: conint(ge=1) = 1
-    pageSize: conint(ge=1, le=100) = 20
+def _get_user() -> Dict[str, Any]:
+    return decode_token(request.headers.get("Authorization")) or {}
 
-class ReceiptLineIn(BaseModel):
-    lineNum: int = Field(ge=0)
-    quantity: confloat(ge=0)
+def _default_whs_from_user() -> Optional[str]:
+    u = _get_user()
+    ws = u.get("warehouses") or []
+    return ws[0] if ws else None
 
-class ReceiptIn(BaseModel):
-    docEntry: int
-    whsCode: str
-    lines: list[ReceiptLineIn] = Field(min_length=1)
-    supplierRef: Optional[str] = None
-
-# ---------- Helpers ----------
-def op_hash(user: str, payload: dict) -> str:
-    raw = json.dumps({"user": user, **payload, "date": str(date.today())}, sort_keys=True)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-# ---------- Endpoints ----------
-@bp_recepciones.get("/api/orders")
+@bp_recepciones.get("/orders")
 @require_auth
 def list_orders():
-    try:
-        q = OrdersQuery(**request.args.to_dict())
-    except ValidationError as e:
-        return jsonify({"error": {"code": "VALIDATION_ERROR", "message": str(e)}}), 400
+    q = request.args
+    due_from   = q.get("due_from")
+    due_to     = q.get("due_to")
+    vendor     = q.get("vendorCode")
+    whs        = q.get("whsCode") or _default_whs_from_user()
+    page       = int(q.get("page", 1))
+    page_size  = int(q.get("pageSize", 20))
 
-    if q.whsCode and not user_can_access_whs(q.whsCode):
-        return jsonify({"error": {"code": "FORBIDDEN", "message": f"No tienes acceso al almacén {q.whsCode}"}}), 403
+    if not whs:
+        return jsonify({"error":{"code":"VALIDATION","message":"No se pudo determinar el almacén del usuario"}}), 400
+    if not user_can_access_whs(whs):
+        return jsonify({"error":{"code":"FORBIDDEN","message":f"Usuario sin acceso a almacén {whs}"}}), 403
 
-    client = SAPClient()
-    data = client.get_open_purchase_orders(
-        due_from=q.due_from, due_to=q.due_to, vendor=q.vendorCode,
-        page=q.page, page_size=q.pageSize
-    )
-    out = []
-    for it in data["value"]:
-        out.append({
-            "docEntry": it.get("DocEntry"),
-            "docNum": it.get("DocNum"),
-            "vendorCode": it.get("CardCode"),
-            "vendorName": it.get("CardName"),
-            "docDueDate": it.get("DocDueDate"),
-            "openLines": None,
-            "totalOpenQty": None
-        })
-    return jsonify({"page": q.page, "pageSize": q.pageSize, "total": len(out), "data": out}), 200
+    client = SapClient()
+    data = client.get_open_purchase_orders(due_from, due_to, vendor, whs, page, page_size)
+    return jsonify(data), 200
 
-@bp_recepciones.get("/api/orders/<int:doc_entry>")
+@bp_recepciones.get("/orders/<int:doc_entry>")
 @require_auth
-def order_detail(doc_entry: int):
-    whs_filter = request.args.get("whsCode")
-    if whs_filter and not user_can_access_whs(whs_filter):
-        return jsonify({"error": {"code": "FORBIDDEN", "message": f"No tienes acceso al almacén {whs_filter}"}}), 403
+def get_order(doc_entry: int):
+    whs = request.args.get("whsCode") or _default_whs_from_user()
+    if not whs:
+        return jsonify({"error":{"code":"VALIDATION","message":"No se pudo determinar el almacén del usuario"}}), 400
+    if not user_can_access_whs(whs):
+        return jsonify({"error":{"code":"FORBIDDEN","message":f"Usuario sin acceso a almacén {whs}"}}), 403
 
-    client = SAPClient()
-    po = client.get_purchase_order(doc_entry)
-    lines = []
-    for ln in po["Lines"]:
-        if whs_filter and ln["WarehouseCode"] != whs_filter:
-            continue
-        lines.append({
-            "lineNum": ln["LineNum"],
-            "itemCode": ln["ItemCode"],
-            "description": ln["ItemDescription"],
-            "warehouseCode": ln["WarehouseCode"],
-            "orderedQty": ln["OrderedQty"],
-            "receivedQty": ln["ReceivedQty"],
-            "openQty": ln["OpenQty"],
-        })
-    return jsonify({
-        "docEntry": po["DocEntry"],
-        "docNum": po["DocNum"],
-        "vendorCode": po["CardCode"],
-        "vendorName": po["CardName"],
-        "docDueDate": po["DocDueDate"],
-        "lines": lines
-    }), 200
+    client = SapClient()
+    data = client.get_purchase_order(doc_entry, whs)
+    # (opcional) si no hay líneas después de filtrar por whs -> 404 "no hay líneas para ese almacén"
+    if not data.get("lines"):
+        return jsonify({"error":{"code":"NOT_FOUND","message":"La OC no tiene líneas abiertas para ese almacén"}}), 404
+    return jsonify(data), 200
 
-@bp_recepciones.post("/api/receipts")
+@bp_recepciones.post("/receipts")
 @require_auth
 def post_receipt():
-    try:
-        payload = ReceiptIn(**request.get_json(force=True))
-    except ValidationError as e:
-        return jsonify({"error": {"code": "VALIDATION_ERROR", "message": str(e)}}), 400
+    body = request.get_json(silent=True) or {}
+    doc_entry   = body.get("docEntry")
+    whs         = body.get("whsCode") or _default_whs_from_user()
+    supplierRef = body.get("supplierRef")
+    lines       = body.get("lines") or []
 
-    if not user_can_access_whs(payload.whsCode):
-        return jsonify({"error": {"code": "FORBIDDEN", "message": f"No tienes acceso al almacén {payload.whsCode}"}}), 403
+    if not isinstance(doc_entry, int):
+        return jsonify({"error":{"code":"VALIDATION","message":"docEntry inválido"}}), 400
+    if not whs:
+        return jsonify({"error":{"code":"VALIDATION","message":"whsCode requerido"}}), 400
+    if not user_can_access_whs(whs):
+        return jsonify({"error":{"code":"FORBIDDEN","message":f"Usuario sin acceso a almacén {whs}"}}), 403
+    if not lines or not isinstance(lines, list):
+        return jsonify({"error":{"code":"VALIDATION","message":"lines es requerido"}}), 400
 
-    user = getattr(request, "_user", {})
-    username = user.get("sub") or user.get("username") or "api"
+    # Validación contra OpenQty actual
+    client = SapClient()
+    detail = client.get_purchase_order(doc_entry, whs)
+    open_by_line = { int(l["lineNum"]): float(l["openQty"]) for l in (detail.get("lines") or []) }
 
-    client = SAPClient()
-    po = client.get_purchase_order(payload.docEntry)
-    open_by_line = {
-        int(ln["LineNum"]): float(ln["OpenQty"])
-        for ln in po["Lines"] if ln["WarehouseCode"] == payload.whsCode
-    }
+    to_post: List[Dict[str, Any]] = []
+    for l in lines:
+        try:
+            ln = int(l["lineNum"]); qty = float(l["quantity"])
+        except Exception:
+            return jsonify({"error":{"code":"VALIDATION","message":"lines: formato inválido"}}), 400
+        if qty < 0:
+            return jsonify({"error":{"code":"VALIDATION","message":f"Cantidad negativa en línea {ln}"}}), 400
+        max_open = open_by_line.get(ln, 0.0)
+        if qty > max_open:
+            return jsonify({"error":{"code":"VALIDATION","message":f"Cantidad {qty} > OpenQty {max_open} en línea {ln}"}}), 400
+        if qty > 0:
+            to_post.append({"lineNum": ln, "quantity": qty})
 
-    for ln in payload.lines:
-        if ln.lineNum not in open_by_line:
-            return jsonify({"error":{
-                "code":"VALIDATION_ERROR",
-                "message": f"Línea {ln.lineNum} no pertenece al almacén {payload.whsCode} o no existe"
-            }}), 409
-        if ln.quantity > open_by_line[ln.lineNum]:
-            return jsonify({"error":{
-                "code":"VALIDATION_ERROR",
-                "message":"quantity exceeds openQty",
-                "details":{"lineNum": ln.lineNum, "quantity": ln.quantity, "openQty": open_by_line[ln.lineNum]}
-            }}), 409
+    if not to_post:
+        return jsonify({"error":{"code":"VALIDATION","message":"No hay cantidades > 0"}}), 400
 
-    oph = op_hash(username, payload.model_dump())
+    # Idempotencia simple: hash por usuario + doc + líneas + fecha (día)
+    user = _get_user()
+    op_str = json.dumps({
+        "sub": user.get("sub"),
+        "docEntry": doc_entry,
+        "whs": whs,
+        "lines": sorted(to_post, key=lambda x: x["lineNum"]),
+        "date": dt.date.today().isoformat()
+    }, separators=(",",":"), sort_keys=True).encode("utf-8")
+    op_hash = hashlib.sha256(op_str).hexdigest()
 
-    with get_db() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("SELECT 1 FROM receipts_log WHERE op_hash=%s", (oph,))
+    with _db() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT 1 FROM receipts_log WHERE op_hash=%s", (op_hash,))
         if cur.fetchone():
-            return jsonify({"error":{
-                "code":"IDEMPOTENT_REPLAY",
-                "message":"Este payload ya fue procesado hoy.",
-                "details":{"opHash": oph}
-            }}), 409
+            return jsonify({"error":{"code":"DUPLICATE","message":"Operación ya registrada (idempotencia)"}}), 409
 
-        sl = client.post_grpo(
-            doc_entry=payload.docEntry,
-            whs_code=payload.whsCode,
-            lines=[{"lineNum": l.lineNum, "quantity": l.quantity} for l in payload.lines],
-            supplier_ref=payload.supplierRef
+    # Post a SAP
+    res = client.post_grpo(doc_entry, whs, to_post, supplierRef)
+    grpo_doc = int(res.get("DocEntry", 0))
+
+    # Log
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO receipts_log (po_doc_entry, po_line_num, item_code, whs_code, posted_qty, posted_by, sl_doc_entry, payload_json, op_hash)
+            VALUES (%s, NULL, NULL, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                doc_entry,
+                whs,
+                sum(x["quantity"] for x in to_post),
+                user.get("sub"),
+                grpo_doc,
+                json.dumps(res)[:65000],
+                op_hash
+            )
         )
-        grpo_de = sl.get("DocEntry")
-
-        for l in payload.lines:
-            cur.execute("""
-                INSERT INTO receipts_log
-                  (po_doc_entry, po_line_num, item_code, whs_code, posted_qty, posted_by, sl_doc_entry, payload_json, op_hash, created_at)
-                VALUES
-                  (%s, %s, NULL, %s, %s, %s, %s, %s::jsonb, %s, NOW())
-            """, (payload.docEntry, l.lineNum, payload.whsCode, l.quantity, username, grpo_de, json.dumps(sl), oph))
         conn.commit()
 
-    return jsonify({
-        "grpoDocEntry": grpo_de,
-        "opHash": oph,
-        "lines": [{"lineNum": l.lineNum, "postedQty": l.quantity} for l in payload.lines]
-    }), 201
+    return jsonify({"grpoDocEntry": grpo_doc, "opHash": op_hash}), 201

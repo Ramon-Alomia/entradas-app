@@ -1,199 +1,208 @@
 # sap_client.py
+from __future__ import annotations
+
 import os
-import time
 import logging
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Optional, Dict, Any, List
 
 import requests
-from requests import Session, RequestException
 
-# ----------------- ENV -----------------
-SERVICE_LAYER_URL = (os.getenv("SERVICE_LAYER_URL") or "").rstrip("/")
+log = logging.getLogger("sap_client")
+
+BASE_URL    = os.getenv("SERVICE_LAYER_URL", "").rstrip("/")
 COMPANY_DB  = os.getenv("COMPANY_DB")
 SL_USER     = os.getenv("SL_USER")
 SL_PASSWORD = os.getenv("SL_PASSWORD")
 
-# TLS híbrido:
-# - SAP_SL_VERIFY_SSL=false  -> NO verifica (solo dev)
-# - SAP_SL_CA_BUNDLE=/ruta   -> usa ese bundle PEM/CRT
-# - Si no hay env, intenta detectar archivos en ./certs/
-VERIFY_FLAG   = os.getenv("SAP_SL_VERIFY_SSL", "true").lower() not in ("0", "false", "no")
-CA_ENV        = os.getenv("SAP_SL_CA_BUNDLE") or os.getenv("REQUESTS_CA_BUNDLE")
-BASE_DIR      = Path(__file__).resolve().parent
-CERTS_DIR     = BASE_DIR / "certs"
-CANDIDATES_IN_CERTS = [
-    "sap_sl_ca.pem",
-    "fullchain.crt",
-    "fullchain.pem",
-    "intermediate.crt",
-    "intermediate.pem",
-    "ca-bundle.crt",
-]
+# TLS bundle (local/Render)
+CA_BUNDLE = os.getenv("SAP_SL_CA_BUNDLE") or os.getenv("REQUESTS_CA_BUNDLE")
+VERIFY_SSL = True
+if os.getenv("SAP_SL_VERIFY_SSL", "true").lower() in ("0", "false", "no", "off"):
+    VERIFY_SSL = False
 
-def _resolve_verify() -> bool | str:
-    """
-    Devuelve el valor para requests.Session.verify:
-      - False -> desactiva verificación (solo dev)
-      - True  -> trust store del sistema
-      - 'ruta' -> archivo PEM/CRT con la cadena de CA
-    Prioridad:
-      1) VERIFY_FLAG false -> False
-      2) SAP_SL_CA_BUNDLE/REQUESTS_CA_BUNDLE si existe
-      3) Primer archivo existente de ./certs/ en CANDIDATES_IN_CERTS
-      4) True
-    """
-    if not VERIFY_FLAG:
-        return False
 
-    # 1) Variable de entorno con ruta
-    if CA_ENV:
-        p = Path(CA_ENV)
-        if not p.is_absolute():
-            p = BASE_DIR / CA_ENV
-        if p.exists():
-            return str(p)
-
-    # 2) Autodetección en ./certs
-    if CERTS_DIR.exists():
-        for name in CANDIDATES_IN_CERTS:
-            p = CERTS_DIR / name
-            if p.exists():
-                return str(p)
-
-    # 3) Trust store del sistema
-    return True
-
-logger = logging.getLogger(__name__)
-
-class SAPClient:
-    """
-    Cliente SAP B1 Service Layer (v1).
-    - Login con jar "limpio" y cookies B1SESSION/ROUTEID (path /b1s/v1)
-    - TLS configurable (CA propia o verify=False)
-    - Reintento automático al recibir 401
-    """
+class SapClient:
     def __init__(self) -> None:
-        if not SERVICE_LAYER_URL or not COMPANY_DB or not SL_USER or not SL_PASSWORD:
-            raise RuntimeError("Faltan variables SAP: SERVICE_LAYER_URL, COMPANY_DB, SL_USER, SL_PASSWORD")
+        self.base = BASE_URL
+        self.s = requests.Session()
+        self.s.headers.update({"Accept": "application/json"})
+        self.s.verify = CA_BUNDLE if VERIFY_SSL and CA_BUNDLE else VERIFY_SSL
+        log.info("SAP SL base=%s | verify=%s", self.base, self.s.verify)
+        self._session_id: Optional[str] = None
 
-        self.base = SERVICE_LAYER_URL
-        self.s: Session = requests.Session()
-        self.s.verify = _resolve_verify()
-        self.s.headers.update({"Content-Type": "application/json", "Accept": "application/json"})
-        self._logged_at: float = 0.0
-
-        # Logs claros de qué se usó
-        v = self.s.verify
-        if isinstance(v, str):
-            logger.info("SAP SL base=%s | verify file=%s | exists=%s", self.base, v, os.path.exists(v))
-        else:
-            logger.info("SAP SL base=%s | verify=%s", self.base, v)
-
-    # ---------- Cookies / Login ----------
-    def _reset_jar_and_set_cookies(self, auth_resp: requests.Response) -> None:
-        data  = auth_resp.json()
-        sid   = data.get("SessionId")
-        route = auth_resp.cookies.get("ROUTEID")
-        self.s.cookies.clear()
-        self.s.cookies.set("B1SESSION", sid, path="/b1s/v1")
-        if route:
-            self.s.cookies.set("ROUTEID", route, path="/")
-        logger.debug("Jar reseteado: %s", self.s.cookies.get_dict())
-
+    # ------------------ sesión ------------------
     def login(self) -> None:
         r = self.s.post(
             f"{self.base}/Login",
             json={"CompanyDB": COMPANY_DB, "UserName": SL_USER, "Password": SL_PASSWORD},
-            timeout=(5, 30)
+            timeout=(5, 30),
         )
         r.raise_for_status()
-        self._reset_jar_and_set_cookies(r)
-        self._logged_at = time.time()
+        data = r.json()
+        sid = data.get("SessionId")
+        route = r.cookies.get("ROUTEID")
+        # reset jar con paths correctos
+        self.s.cookies.clear()
+        self.s.cookies.set("B1SESSION", sid, path="/b1s/v1")
+        if route:
+            self.s.cookies.set("ROUTEID", route, path="/")
+        self._session_id = sid
 
     def ensure_session(self) -> None:
-        if "B1SESSION" not in self.s.cookies or (time.time() - self._logged_at) > (25 * 60):
+        if not self._session_id:
             self.login()
 
-    def _retry_401(self, method: str, url: str, **kwargs) -> requests.Response:
-        try:
-            r = self.s.request(method, url, **kwargs)
-            if r.status_code == 401:
-                self.login()
-                time.sleep(0.2)
-                r = self.s.request(method, url, **kwargs)
-            r.raise_for_status()
-            return r
-        except RequestException as e:
-            logger.error("SL %s %s error: %s", method, url, e, exc_info=True)
-            raise
-
-    # ---------- Helpers ----------
+    # ------------------ helpers ------------------
     @staticmethod
-    def _po_filter(due_from: Optional[str], due_to: Optional[str], vendor: Optional[str]) -> str:
-        parts = ["DocumentStatus eq 'bost_Open'"]
-        if due_from: parts.append(f"DocDueDate ge {due_from!r}")
-        if due_to:   parts.append(f"DocDueDate le {due_to!r}")
-        if vendor:   parts.append(f"CardCode eq {vendor!r}")
-        return " and ".join(parts)
+    def _date_iso(d: Optional[str]) -> Optional[str]:
+        if not d:
+            return None
+        # 'YYYY-MM-DD' -> 'YYYY-MM-DDT00:00:00Z'
+        return f"{d}T00:00:00Z"
 
-    # ---------- API ----------
-    def get_open_purchase_orders(self, *, due_from: Optional[str], due_to: Optional[str],
-                                 vendor: Optional[str], page: int, page_size: int) -> Dict[str, Any]:
+    # ------------------ endpoints ------------------
+    def get_open_purchase_orders(
+        self,
+        due_from: Optional[str],
+        due_to: Optional[str],
+        vendor: Optional[str],
+        whs: Optional[str],
+        page: int = 1,
+        page_size: int = 20,
+    ) -> Dict[str, Any]:
+        """Lista OCs abiertas con alguna línea abierta en el almacén solicitado."""
         self.ensure_session()
-        top  = max(1, min(page_size, 100))
-        skip = (max(1, page) - 1) * top
-        flt  = self._po_filter(due_from, due_to, vendor)
-        url = (f"{self.base}/PurchaseOrders"
-               f"?$select=DocEntry,DocNum,CardCode,CardName,DocDueDate,DocumentStatus"
-               f"&$filter={flt}"
-               f"&$orderby=DocDueDate asc,DocNum asc"
-               f"&$top={top}&$skip={skip}")
-        r = self._retry_401("GET", url, timeout=(5, 30))
-        return {"value": r.json().get("value", [])}
 
-    def get_purchase_order(self, doc_entry: int) -> Dict[str, Any]:
+        filters: List[str] = ["DocumentStatus eq 'bost_Open'"]
+        if due_from:
+            filters.append(f"DocDueDate ge {self._date_iso(due_from)}")
+        if due_to:
+            filters.append(f"DocDueDate le {self._date_iso(due_to)}")
+        if vendor:
+            filters.append(f"CardCode eq '{vendor}'")
+        if whs:
+            filters.append(
+                f"DocumentLines/any(d:d/WarehouseCode eq '{whs}' and d/OpenQuantity gt 0)"
+            )
+
+        filter_str = " and ".join(filters)
+        top = max(1, min(int(page_size), 100))
+        skip = max(0, (max(1, int(page)) - 1) * top)
+
+        params = {
+            "$select": "DocEntry,DocNum,DocDueDate,CardCode,CardName",
+            "$filter": filter_str,
+            "$count": "true",
+            "$orderby": "DocDueDate asc,DocEntry asc",
+            "$top": str(top),
+            "$skip": str(skip),
+        }
+
+        r = self.s.get(f"{self.base}/PurchaseOrders", params=params, timeout=(5, 30))
+        if r.status_code == 401:
+            self.login()
+            r = self.s.get(f"{self.base}/PurchaseOrders", params=params, timeout=(5, 30))
+        r.raise_for_status()
+
+        payload = r.json()
+        total = int(payload.get("@odata.count", 0))
+        rows = payload.get("value", [])
+
+        data = []
+        for it in rows:
+            data.append(
+                {
+                    "docEntry": it["DocEntry"],
+                    "docNum": it["DocNum"],
+                    "docDueDate": it.get("DocDueDate"),
+                    "vendorCode": it.get("CardCode"),
+                    "vendorName": it.get("CardName"),
+                    "openLines": None,
+                    "totalOpenQty": None,
+                }
+            )
+        return {"data": data, "page": int(page), "pageSize": top, "total": total}
+
+    def get_purchase_order(self, doc_entry: int, whs: Optional[str]) -> Dict[str, Any]:
+        """Detalle de OC; si whs se envía, filtra líneas por ese almacén."""
         self.ensure_session()
-        url = f"{self.base}/PurchaseOrders({doc_entry})?$select=DocEntry,DocNum,CardCode,CardName,DocDueDate,DocumentLines"
-        r = self._retry_401("GET", url, timeout=(5, 30))
-        po = r.json()
-        lines_out: List[Dict[str, Any]] = []
-        for ln in po.get("DocumentLines", []):
-            qty = float(ln.get("Quantity", 0) or 0)
-            rec = float(ln.get("ReceivedQuantity", 0) or 0)
-            open_qty = max(qty - rec, 0.0)
-            lines_out.append({
-                "LineNum": ln.get("LineNum"),
-                "ItemCode": ln.get("ItemCode"),
-                "ItemDescription": ln.get("ItemDescription"),
-                "WarehouseCode": ln.get("WarehouseCode"),
-                "OrderedQty": qty,
-                "ReceivedQty": rec,
-                "OpenQty": open_qty,
-            })
+
+        expand = "DocumentLines($select=LineNum,ItemCode,ItemDescription,Quantity,OpenQuantity,WarehouseCode)"
+        if whs:
+            expand = (
+                "DocumentLines("
+                f"$filter=WarehouseCode eq '{whs}';"
+                "$select=LineNum,ItemCode,ItemDescription,Quantity,OpenQuantity,WarehouseCode)"
+            )
+
+        params = {"$select": "DocEntry,DocNum,DocDueDate", "$expand": expand}
+
+        r = self.s.get(f"{self.base}/PurchaseOrders({doc_entry})", params=params, timeout=(5, 30))
+        if r.status_code == 401:
+            self.login()
+            r = self.s.get(f"{self.base}/PurchaseOrders({doc_entry})", params=params, timeout=(5, 30))
+        r.raise_for_status()
+        o = r.json()
+
+        lines_out = []
+        for d in (o.get("DocumentLines") or []):
+            lines_out.append(
+                {
+                    "lineNum": d["LineNum"],
+                    "itemCode": d["ItemCode"],
+                    "description": d.get("ItemDescription"),
+                    "orderedQty": float(d.get("Quantity", 0) or 0),
+                    "receivedQty": float(d.get("Quantity", 0) or 0)
+                    - float(d.get("OpenQuantity", 0) or 0),
+                    "openQty": float(d.get("OpenQuantity", 0) or 0),
+                    "warehouseCode": d.get("WarehouseCode"),
+                }
+            )
         return {
-            "DocEntry": po.get("DocEntry"),
-            "DocNum": po.get("DocNum"),
-            "CardCode": po.get("CardCode"),
-            "CardName": po.get("CardName"),
-            "DocDueDate": po.get("DocDueDate"),
-            "Lines": lines_out,
+            "docEntry": o["DocEntry"],
+            "docNum": o["DocNum"],
+            "docDueDate": o.get("DocDueDate"),
+            "lines": lines_out,
         }
 
-    def post_grpo(self, *, doc_entry: int, whs_code: str,
-                  lines: List[Dict[str, Any]], supplier_ref: Optional[str]) -> Dict[str, Any]:
+    def post_grpo(
+        self,
+        po_doc_entry: int,
+        whs: str,
+        lines: List[Dict[str, Any]],
+        supplier_ref: Optional[str],
+    ) -> Dict[str, Any]:
+        """
+        Crea GRPO desde líneas de la OC.
+        lines: [{lineNum, quantity}]
+        """
         self.ensure_session()
-        dl = [{
-            "BaseType": 22, "BaseEntry": int(doc_entry), "BaseLine": int(ln["lineNum"]),
-            "Quantity": float(ln["quantity"]), "WarehouseCode": whs_code
-        } for ln in lines]
-        payload: Dict[str, Any] = {
-            "DocDate":  time.strftime("%Y-%m-%d"),
-            "Comments": f"Recepción portal - PO {doc_entry}",
-            "DocumentLines": dl
+
+        doc_lines = []
+        for l in lines:
+            doc_lines.append(
+                {
+                    "BaseType": 22,  # Purchase Orders
+                    "BaseEntry": po_doc_entry,
+                    "BaseLine": int(l["lineNum"]),
+                    "Quantity": float(l["quantity"]),
+                    "WarehouseCode": whs,
+                }
+            )
+
+        payload = {
+            "DocDate": None,  # usa hoy
+            "U_SupplierRef": supplier_ref if supplier_ref else None,
+            "DocumentLines": doc_lines,
         }
-        if supplier_ref:
-            payload["Comments"] += f" | Ref: {supplier_ref}"
-        r = self._retry_401("POST", f"{self.base}/PurchaseDeliveryNotes",
-                            json=payload, headers={"Prefer": "return=representation"}, timeout=(5, 60))
+
+        r = self.s.post(
+            f"{self.base}/PurchaseDeliveryNotes", json=payload, timeout=(5, 60)
+        )
+        if r.status_code == 401:
+            self.login()
+            r = self.s.post(
+                f"{self.base}/PurchaseDeliveryNotes", json=payload, timeout=(5, 60)
+            )
+        r.raise_for_status()
         return r.json()

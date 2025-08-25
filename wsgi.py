@@ -1,2 +1,3 @@
 # wsgi.py
-from app import app  # importa la instancia 'app' definida en app.py
+from app import create_app
+app = create_app()

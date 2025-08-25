@@ -1,15 +1,20 @@
 // static/app.js
 const state = {
-  base: '',           // se detecta automáticamente
+  base: '',
   token: null,
   user: null,
   currentDoc: null,
   currentWhs: null,
-  lines: []
+  lines: [],
+  page: 1,
+  pageSize: 20,
+  total: 0
 };
 
 function $(id) { return document.getElementById(id); }
 function fmtDate(dt) { return dt.toISOString().slice(0,10); }
+
+function setText(id, text) { const el = $(id); if (el) el.textContent = text; }
 
 async function api(path, opts = {}) {
   const url = `${state.base}${path}`;
@@ -39,56 +44,76 @@ function setLoggedIn(user, token) {
   $('loginCard').classList.add('hidden');
   $('dashCard').classList.remove('hidden');
 
-  // llena almacenes del token
-  const whsSel = $('whsSelect');
-  whsSel.innerHTML = '';
+  // almacenes del token
+  const whsSel = $('whsSelect'); whsSel.innerHTML = '';
   (user.warehouses || []).forEach(w => {
-    const opt = document.createElement('option');
-    opt.value = w; opt.textContent = w;
-    whsSel.appendChild(opt);
+    const opt = document.createElement('option'); opt.value=w; opt.textContent=w; whsSel.appendChild(opt);
   });
   if (user.warehouses?.length) {
-    state.currentWhs = user.warehouses[0];
-    whsSel.value = state.currentWhs;
+    state.currentWhs = user.warehouses[0]; whsSel.value = state.currentWhs;
   }
 
-  // fechas por defecto: mes actual
+  // fechas por defecto
   const now = new Date();
   const first = new Date(now.getFullYear(), now.getMonth(), 1);
-  const next = new Date(now.getFullYear(), now.getMonth()+1, 1);
+  const next  = new Date(now.getFullYear(), now.getMonth()+1, 1);
   $('dueFrom').value = fmtDate(first);
-  $('dueTo').value = fmtDate(next);
+  $('dueTo').value   = fmtDate(next);
 
-  // búsqueda inicial
-  loadOrders().catch(err => $('ordersMsg').textContent = err.message);
+  // busca
+  loadOrders().catch(err => setText('ordersMsg', err.message));
 }
 
 async function doLogin() {
-  $('loginMsg').textContent = '';
+  setText('loginMsg', '');
   const username = $('username').value.trim();
   const password = $('password').value;
-  if (!username || !password) {
-    $('loginMsg').textContent = 'Ingresa usuario y contraseña';
-    return;
-  }
+  if (!username || !password) { setText('loginMsg','Ingresa usuario y contraseña'); return; }
   try {
-    const data = await api('/api/login', { method: 'POST', json: { username, password } });
+    const data = await api('/api/login', { method:'POST', json:{ username, password } });
     setLoggedIn({ sub:data.username, role:data.role, warehouses:data.warehouses }, data.token);
-    $('loginMsg').textContent = '';
-  } catch (e) {
-    $('loginMsg').textContent = 'Error: ' + e.message;
-  }
+  } catch (e) { setText('loginMsg', 'Error: ' + e.message); }
+}
+
+function buildPagination() {
+  const totalPages = Math.max(1, Math.ceil((state.total || 0) / state.pageSize));
+  const cont = document.createElement('div');
+  cont.style.display = 'flex';
+  cont.style.justifyContent = 'space-between';
+  cont.style.alignItems = 'center';
+  cont.style.marginTop = '8px';
+
+  const left = document.createElement('div');
+  left.textContent = `Página ${state.page} de ${totalPages} — ${state.total} resultados`;
+  const right = document.createElement('div');
+
+  const prev = document.createElement('button');
+  prev.textContent = '← Anterior';
+  prev.className = 'secondary';
+  prev.disabled = state.page <= 1;
+  prev.onclick = () => { if (state.page>1) { state.page--; loadOrders().catch(e=>setText('ordersMsg', e.message)); } };
+
+  const next = document.createElement('button');
+  next.textContent = 'Siguiente →';
+  next.className = 'secondary';
+  next.style.marginLeft = '8px';
+  next.disabled = state.page >= totalPages;
+  next.onclick = () => { if (state.page<totalPages) { state.page++; loadOrders().catch(e=>setText('ordersMsg', e.message)); } };
+
+  right.appendChild(prev); right.appendChild(next);
+  cont.appendChild(left); cont.appendChild(right);
+  return cont;
 }
 
 async function loadOrders() {
-  $('ordersMsg').textContent = 'Cargando...';
+  setText('ordersMsg', 'Cargando...');
   const vendor = $('vendorCode').value.trim();
-  const dueFrom = $('dueFrom').value;
-  const dueTo   = $('dueTo').value;
-  const whs     = $('whsSelect').value;
+  const dueFrom= $('dueFrom').value;
+  const dueTo  = $('dueTo').value;
+  const whs    = $('whsSelect').value;
   state.currentWhs = whs;
 
-  const params = new URLSearchParams({ page:'1', pageSize:'25', due_from:dueFrom, due_to:dueTo });
+  const params = new URLSearchParams({ page:String(state.page), pageSize:String(state.pageSize), due_from:dueFrom, due_to:dueTo });
   if (vendor) params.set('vendorCode', vendor);
   if (whs)    params.set('whsCode', whs);
 
@@ -100,7 +125,7 @@ async function loadOrders() {
     const btn = document.createElement('button');
     btn.textContent = 'Ver detalle';
     btn.className = 'secondary';
-    btn.onclick = () => loadDetail(row.docEntry);
+    btn.onclick = () => loadDetail(row.docEntry).catch(err => { setText('detailMsg', err.message); $('detailCard').classList.remove('hidden'); });
 
     tr.innerHTML = `
       <td>${row.docNum}</td>
@@ -111,23 +136,28 @@ async function loadOrders() {
     tr.children[4].appendChild(btn);
     tbody.appendChild(tr);
   });
-  $('ordersMsg').textContent = `${out.data?.length || 0} resultados`;
+  state.total = out.total || 0;
+
+  // render paginación
+  const card = $('dashCard');
+  // elimina paginadores previos
+  [...card.querySelectorAll('.pager')].forEach(n => n.remove());
+  const pager = buildPagination(); pager.classList.add('pager');
+  card.appendChild(pager);
+
+  setText('ordersMsg', `${out.data?.length || 0} resultados`);
 }
 
 async function loadDetail(docEntry) {
-  $('detailMsg').textContent = 'Cargando...';
+  setText('detailMsg', 'Cargando...');
   const whs = state.currentWhs || $('whsSelect').value;
-  const params = new URLSearchParams();
-  if (whs) params.set('whsCode', whs);
+  const params = new URLSearchParams(); if (whs) params.set('whsCode', whs);
   const data = await api(`/api/orders/${docEntry}?${params.toString()}`);
-  state.currentDoc = docEntry;
-  state.lines = data.lines || [];
+  state.currentDoc = docEntry; state.lines = data.lines || [];
   $('detailTitle').textContent = `DocEntry ${docEntry}`;
-  const tbody = $('linesTbl').querySelector('tbody');
-  tbody.innerHTML = '';
+  const tbody = $('linesTbl').querySelector('tbody'); tbody.innerHTML = '';
   state.lines.forEach(line => {
-    const max = Number(line.openQty || 0);
-    const inputId = `q_${line.lineNum}`;
+    const max = Number(line.openQty || 0); const inputId = `q_${line.lineNum}`;
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${line.lineNum}</td>
@@ -147,45 +177,34 @@ async function loadDetail(docEntry) {
     });
   });
   $('detailCard').classList.remove('hidden');
-  $('detailMsg').textContent = '';
+  setText('detailMsg', '');
 }
 
 async function postReceipt() {
-  $('detailMsg').textContent = '';
-  if (!state.currentDoc) {
-    $('detailMsg').textContent = 'Selecciona primero una OC';
-    return;
-  }
+  setText('detailMsg','');
+  if (!state.currentDoc) { setText('detailMsg','Selecciona primero una OC'); return; }
   const whs = state.currentWhs || $('whsSelect').value;
   const supplierRef = $('supplierRef').value.trim() || undefined;
 
   const selected = [];
   for (const line of state.lines) {
-    const input = $(`q_${line.lineNum}`);
-    if (!input) continue;
-    const qty = Number(input.value);
+    const inp = $(`q_${line.lineNum}`); if (!inp) continue;
+    const qty = Number(inp.value);
     if (qty > 0) {
-      if (qty > Number(line.openQty)) {
-        $('detailMsg').textContent = `Cantidad en línea ${line.lineNum} excede OpenQty`;
-        return;
-      }
+      if (qty > Number(line.openQty)) { setText('detailMsg', `Cantidad en línea ${line.lineNum} excede OpenQty`); return; }
       selected.push({ lineNum: line.lineNum, quantity: qty });
     }
   }
-  if (selected.length === 0) {
-    $('detailMsg').textContent = 'No hay cantidades > 0 para registrar.';
-    return;
-  }
+  if (selected.length === 0) { setText('detailMsg', 'No hay cantidades > 0 para registrar.'); return; }
 
   try {
     const payload = { docEntry: state.currentDoc, whsCode: whs, lines: selected };
     if (supplierRef) payload.supplierRef = supplierRef;
     const res = await api('/api/receipts', { method:'POST', json: payload });
-    $('detailMsg').innerHTML = `<span class="ok">✅ GRPO creado: DocEntry ${res.grpoDocEntry}</span>`;
-    // refrescar el detalle para ver nuevos OpenQty
+    setText('detailMsg', `✅ GRPO creado: DocEntry ${res.grpoDocEntry}`);
     await loadDetail(state.currentDoc);
   } catch (e) {
-    $('detailMsg').innerHTML = `<span class="error">❌ ${e.message}</span>`;
+    setText('detailMsg', `❌ ${e.message}`);
   }
 }
 
@@ -195,35 +214,22 @@ function restoreSession() {
     const t = sessionStorage.getItem('recep_token');
     const u = sessionStorage.getItem('recep_user');
     if (t && u) {
-      state.token = t;
-      state.user = JSON.parse(u);
-      $('loginCard').classList.add('hidden');
-      $('dashCard').classList.remove('hidden');
-      // volver a pintar almacenes
-      const whsSel = $('whsSelect');
-      whsSel.innerHTML = '';
-      (state.user.warehouses || []).forEach(w => {
-        const opt = document.createElement('option'); opt.value = w; opt.textContent = w; whsSel.appendChild(opt);
-      });
-      if (state.user.warehouses?.length) {
-        state.currentWhs = state.user.warehouses[0];
-        whsSel.value = state.currentWhs;
-      }
-      // fechas default
-      const now = new Date();
-      const first = new Date(now.getFullYear(), now.getMonth(), 1);
-      const next = new Date(now.getFullYear(), now.getMonth()+1, 1);
-      $('dueFrom').value = fmtDate(first);
-      $('dueTo').value = fmtDate(next);
-      loadOrders().catch(err => $('ordersMsg').textContent = err.message);
+      state.token = t; state.user = JSON.parse(u);
+      $('loginCard').classList.add('hidden'); $('dashCard').classList.remove('hidden');
+      const whsSel = $('whsSelect'); whsSel.innerHTML = '';
+      (state.user.warehouses || []).forEach(w => { const o=document.createElement('option'); o.value=w; o.textContent=w; whsSel.appendChild(o); });
+      if (state.user.warehouses?.length) { state.currentWhs = state.user.warehouses[0]; whsSel.value = state.currentWhs; }
+      const now = new Date(); const first = new Date(now.getFullYear(), now.getMonth(), 1); const next = new Date(now.getFullYear(), now.getMonth()+1, 1);
+      $('dueFrom').value = fmtDate(first); $('dueTo').value = fmtDate(next);
+      loadOrders().catch(err => setText('ordersMsg', err.message));
     }
   } catch {}
 }
 
 window.addEventListener('DOMContentLoaded', () => {
   $('btnLogin').addEventListener('click', doLogin);
-  $('btnSearch').addEventListener('click', () => loadOrders().catch(err => $('ordersMsg').textContent = err.message));
+  $('btnSearch').addEventListener('click', () => { state.page=1; loadOrders().catch(err => setText('ordersMsg', err.message)); });
   $('btnPost').addEventListener('click', postReceipt);
-  $('whsSelect').addEventListener('change', () => { state.currentWhs = $('whsSelect').value; });
+  $('whsSelect').addEventListener('change', () => { state.currentWhs = $('whsSelect').value; state.page=1; loadOrders().catch(e=>setText('ordersMsg', e.message)); });
   restoreSession();
 });
