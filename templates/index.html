@@ -4,55 +4,91 @@
   <meta charset="utf-8" />
   <title>Recepciones – Portal</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="/static/styles.css">
+
+  <!-- Paleta Bersa -->
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background: #f6f7fb; }
-    header { background: #0b5fff; color: #fff; padding: 12px 16px; }
-    main { max-width: 1080px; margin: 16px auto; padding: 0 16px; }
-    .card { background: #fff; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,.06); padding: 16px; margin-bottom: 16px; }
-    .row { display: flex; gap: 12px; flex-wrap: wrap; }
-    .row > * { flex: 1; min-width: 220px; }
-    label { display: block; font-size: 12px; color: #555; margin-bottom: 4px;}
-    input, select, button { width: 100%; padding: 8px; border-radius: 8px; border: 1px solid #ddd; font-size: 14px; }
-    button.primary { background:#0b5fff; color:#fff; border:none; cursor:pointer; }
-    button.secondary { background:#f1f4ff; color:#0b5fff; border:1px solid #c7d2fe; cursor:pointer; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 8px; border-bottom: 1px solid #eee; text-align: left; }
-    th { background: #f9fafc; font-weight: 600; font-size: 13px; color:#495057; }
-    .hidden { display: none; }
-    .status { font-size: 13px; color:#666; }
-    .error { color: #b00020; }
-    .ok { color: #0a7f3f; }
-    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#eef2ff; color:#1d4ed8; font-size:12px;}
+    :root{
+      --bersa-azul: #0B2241;   /* dominante */
+      --bersa-rojo: #E62D33;   /* acento */
+      --bersa-amar: #FF9C27;   /* acento */
+      --bg: #f6f7fb;
+      --card: #ffffff;
+      --text: #0b1221;
+      --muted: #6b7280;
+      --border: #e8ecf2;
+      --primary: var(--bersa-azul);
+      --accent: var(--bersa-amar);
+      --danger: var(--bersa-rojo);
+    }
+    *{ box-sizing:border-box }
+    body{
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      margin: 0; background: var(--bg); color: var(--text);
+    }
+    header{
+      background: var(--primary); color: #fff; padding: 14px 16px;
+      display:flex; align-items:center; justify-content:space-between;
+    }
+    header .right a{
+      color:#fff; text-decoration:none; background: rgba(255,255,255,0.12);
+      padding: 8px 12px; border-radius: 10px; border:1px solid rgba(255,255,255,0.18);
+    }
+    header .right a:hover{ background: rgba(255,255,255,0.22); }
+    main{ max-width: 1080px; margin: 16px auto; padding: 0 16px; }
+    .card{
+      background: var(--card); border-radius: 12px; border:1px solid var(--border);
+      box-shadow: 0 2px 8px rgba(0,0,0,.05); padding: 16px; margin-bottom: 16px;
+    }
+    .row{ display:flex; gap:12px; flex-wrap:wrap; }
+    .row > * { flex:1; min-width: 220px; }
+    label{ display:block; font-size:12px; color:#4b5563; margin-bottom:4px; }
+    input, select, button{
+      width:100%; padding: 10px 12px; border-radius: 10px; border:1px solid #d7dbe3; font-size:14px; background:#fff;
+    }
+    input:focus, select:focus{ outline:none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(255,156,39,0.2); }
+    button.primary{ background: var(--primary); color:#fff; border:none; cursor:pointer; }
+    button.secondary{
+      background: #f1f4ff; color: var(--primary); border:1px solid #c7d2fe; cursor:pointer;
+    }
+    button.secondary:hover{ background:#e8ecff; }
+    button.primary:hover{ filter: brightness(1.06); }
+    .btn-accent{ background: var(--accent); color:#111; border:none; }
+    .btn-danger{ background: var(--danger); color:#fff; border:none; }
+
+    table{ width:100%; border-collapse: collapse; }
+    th, td{ padding: 10px; border-bottom: 1px solid #eef1f6; text-align:left; }
+    th{ background: #f9fafc; font-weight: 600; font-size: 13px; color:#495057; }
+    .hidden{ display:none; }
+    .status{ font-size: 13px; color: var(--muted); }
+    .error{ color: var(--danger); }
+    .ok{ color: #0a7f3f; }
+    .pill{
+      display:inline-block; padding: 2px 10px; border-radius: 999px;
+      background: #eef2ff; color: var(--primary); font-size: 12px; border:1px solid #dbe1ff;
+    }
+
+    /* Paginación */
+    .pager{ margin-top: 8px; }
+    .pager button{ width:auto; }
+
+    /* Chips sutiles para totales */
+    .chip{
+      display:inline-block; padding: 2px 8px; border-radius: 8px; font-size:12px; border:1px solid var(--border);
+      background: #fff7ed; color:#9a3412; /* tono acorde a --accent */
+    }
   </style>
 </head>
 <body>
   <header>
     <strong>Portal de Recepciones</strong>
+    <div class="right">
+      <a href="/logout" title="Cerrar sesión">Cerrar sesión</a>
+    </div>
   </header>
-  <main>
-    <!-- LOGIN -->
-    <section id="loginCard" class="card">
-      <h3>Iniciar Sesión</h3>
-      <div class="row">
-        <div>
-          <label>Usuario</label>
-          <input id="username" placeholder="User0001" autocomplete="username">
-        </div>
-        <div>
-          <label>Contraseña</label>
-          <input id="password" type="password" placeholder="••••••••" autocomplete="current-password">
-        </div>
-        <div style="align-self:flex-end;">
-          <button id="btnLogin" class="primary">Entrar</button>
-        </div>
-      </div>
-      <div id="loginMsg" class="status"></div>
-    </section>
 
+  <main>
     <!-- DASHBOARD -->
-    <section id="dashCard" class="card hidden">
+    <section id="dashCard" class="card">
       <div class="row">
         <div><label>Almacén</label><select id="whsSelect"></select></div>
         <div><label>Proveedor (CardCode)</label><input id="vendorCode" placeholder="(opcional)"></div>
@@ -60,8 +96,8 @@
         <div><label>Vencimiento hasta</label><input id="dueTo" type="date"></div>
         <div style="align-self:flex-end;"><button id="btnSearch" class="secondary">Buscar</button></div>
       </div>
-      <div id="ordersMsg" class="status"></div>
-      <div style="overflow:auto;">
+      <div id="ordersMsg" class="status" style="margin-top:6px;"></div>
+      <div style="overflow:auto; margin-top:8px;">
         <table id="ordersTbl">
           <thead>
             <tr>
@@ -80,7 +116,7 @@
     <!-- DETALLE -->
     <section id="detailCard" class="card hidden">
       <h3>Detalle OC <span id="detailTitle" class="pill"></span></h3>
-      <div class="row">
+      <div class="row" style="margin-top:6px;">
         <div><label>Referencia del proveedor</label><input id="supplierRef" placeholder="Folio/Remisión (opcional)"></div>
         <div style="align-self:flex-end;"><button id="btnPost" class="primary">Registrar entrada</button></div>
         <div id="detailMsg" class="status"></div>

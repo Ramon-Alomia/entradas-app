@@ -3,19 +3,19 @@ import os
 import logging
 from datetime import timedelta
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, redirect, request
 from flask_cors import CORS
 from flask_talisman import Talisman
 from dotenv import load_dotenv
 
-# Blueprints (asegúrate de que existan estos módulos)
-from auth import bp_auth               # url_prefix="/api"
-from recepciones_api import bp_recepciones  # url_prefix="/api"
-from admin import bp_admin_api, bp_admin_ui  # "/api/admin" y "/admin"
+# Blueprints
+from auth import bp_auth, decode_token          # auth expone /login, /logout, /me y decode_token
+from recepciones_api import bp_recepciones      # /api/orders, /api/receipts...
+from admin import bp_admin_api, bp_admin_ui     # /admin/* (UI) y /admin/* (JSON)
 
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
 # Config helpers
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
 
 def _get_allowed_origins():
     """
@@ -32,13 +32,12 @@ def _get_allowed_origins():
     return [o.strip() for o in raw.split(",") if o.strip()]
 
 def _make_app_config(app: Flask):
-    # Secret key para sesiones CSRF en vistas Jinja (no se usa en JWT)
     secret = os.getenv("SECRET_KEY")
     if not secret:
         raise RuntimeError("SECRET_KEY no está configurada (env)")
     app.secret_key = secret
 
-    # Cookies seguras (ya que desplegamos en HTTPS en Render)
+    # Cookies seguras (Render usa HTTPS)
     app.config.update(
         SESSION_COOKIE_SECURE=True,
         SESSION_COOKIE_HTTPONLY=True,
@@ -48,7 +47,7 @@ def _make_app_config(app: Flask):
     )
 
 def _set_security_headers(app: Flask):
-    # Content Security Policy (ajusta si sirves JS de otros orígenes)
+    # Content Security Policy (ajústala si sirves activos externos)
     csp = {
         "default-src": ["'self'"],
         "script-src": ["'self'", "cdnjs.cloudflare.com"],
@@ -67,7 +66,7 @@ def _set_security_headers(app: Flask):
 def _enable_cors(app: Flask):
     origins = _get_allowed_origins()
     if not origins:
-        # Por defecto: mismo origen; si necesitas abrir, usa CORS_ORIGINS en .env
+        # Mismo origen por defecto (no abrimos CORS si no se especifica)
         return
     CORS(
         app,
@@ -78,12 +77,12 @@ def _enable_cors(app: Flask):
         max_age=86400,
     )
 
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
 # App factory
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
 
 def create_app() -> Flask:
-    # Carga .env solo en entorno local (Render ya inyecta env)
+    # En local cargamos .env (en Render ya inyecta envs)
     if not os.getenv("RENDER"):
         load_dotenv()
 
@@ -97,13 +96,9 @@ def create_app() -> Flask:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     app.logger.setLevel(logging.getLogger().level)
 
-    # Configuración base
+    # Config base + seguridad
     _make_app_config(app)
-
-    # Seguridad (CSP/HSTS)
     _set_security_headers(app)
-
-    # CORS para /api/*
     _enable_cors(app)
 
     # ---------------- Health / Ping ----------------
@@ -115,7 +110,7 @@ def create_app() -> Flask:
     def ping():
         return "pong", 200
 
-    # ---------------- Error handlers homogéneos ----------------
+    # ---------------- Errores homogéneos ----------------
     @app.errorhandler(400)
     def _bad_request(e):
         return jsonify({"error": {"code": "BAD_REQUEST", "message": str(e)}}), 400
@@ -138,21 +133,31 @@ def create_app() -> Flask:
         return jsonify({"error": {"code": "UNEXPECTED_ERROR", "message": str(e)}}), 500
 
     # ---------------- Blueprints ----------------
-    app.register_blueprint(bp_auth)
-    app.register_blueprint(bp_recepciones)
-    app.register_blueprint(bp_admin_api)
-    app.register_blueprint(bp_admin_ui)
+    app.register_blueprint(bp_auth)          # /login, /logout, /me (cookies HttpOnly)
+    app.register_blueprint(bp_recepciones)   # /api/orders, /api/receipts,...
+    app.register_blueprint(bp_admin_api)     # /admin JSON
+    app.register_blueprint(bp_admin_ui)      # /admin UI
 
-    # ---------------- Ruta raíz (login) ----------------
+    # ---------------- Raíz: redirige a /login si no hay sesión ----------------
     @app.get("/")
-    def index_page():
-        # Sirve la página de login (templates/index.html)
+    def root():
+        token = request.cookies.get("token")
+        user = None
+        if token:
+            try:
+                user = decode_token(token)
+            except Exception:
+                user = None
+        if not user:
+            # Sin sesión → ve al login (plantilla /login del blueprint auth)
+            return redirect("/login")
+        # Con sesión → sirve el dashboard (index.html)
         return render_template("index.html")
 
     app.logger.info("App lista. CORS_ORIGINS=%s", _get_allowed_origins())
     return app
 
-# App global (para Gunicorn con wsgi:app)
+# App global para Gunicorn (wsgi:app)
 app = create_app()
 
 # Dev server
