@@ -1,156 +1,172 @@
+# auth.py
 from __future__ import annotations
 
 import os
-import datetime as dt
-from typing import Optional, Dict, Any
+import time
 from functools import wraps
+from typing import Optional, Dict, Any, List
 
 import psycopg
 from psycopg.rows import dict_row
-from flask import Blueprint, request, jsonify, current_app, redirect, make_response, render_template
-
+from flask import Blueprint, request, jsonify
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, InvalidHashError
-import jwt
+import jwt  # PyJWT
 
-# --- Config ---
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
 DB_URL = os.getenv("DATABASE_URL")
 JWT_SECRET = os.getenv("JWT_SECRET")
-JWT_ALG = "HS256"
+JWT_ISSUER = os.getenv("JWT_ISSUER", "recepciones-api")
+JWT_TTL_HOURS = int(os.getenv("JWT_TTL_HOURS", "8"))
 
-# Nombre único para el blueprint de autenticación (sin prefijo '/api')
-bp_auth = Blueprint("auth", __name__)
+if not DB_URL:
+    raise RuntimeError("DATABASE_URL no configurada")
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET no configurada")
 
-# Hasher Argon2id
 ph = PasswordHasher()
 
-
 def _db():
-    if not DB_URL:
-        raise RuntimeError("DATABASE_URL no está configurada")
     return psycopg.connect(DB_URL)
 
+# -----------------------------------------------------------------------------
+# Blueprint
+# -----------------------------------------------------------------------------
+# Mantenemos /api para no romper el frontend actual (app.js usa /api/login)
+bp_auth = Blueprint("auth", __name__, url_prefix="/api")
 
-def _make_token(payload: Dict[str, Any]) -> str:
-    now = dt.datetime.utcnow()
-    to_encode = {
-        "sub": payload["username"],
-        "role": payload["role"],
-        "warehouses": payload.get("warehouses", []),
-        "iat": int(now.timestamp()),
-        "nbf": int((now - dt.timedelta(seconds=60)).timestamp()),
-        "exp": int((now + dt.timedelta(hours=8)).timestamp()),
-        "iss": "recepciones-api",
-    }
-    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALG)
+# -----------------------------------------------------------------------------
+# Utils JWT
+# -----------------------------------------------------------------------------
+def _bearer_token_from_header(authorization: Optional[str]) -> Optional[str]:
+    if not authorization:
+        return None
+    auth = authorization.strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return auth  # si llega el token "pelado"
 
-
-def decode_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
+def decode_token(authorization_header: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Decodifica el JWT del header Authorization. Retorna dict o None."""
+    token = _bearer_token_from_header(authorization_header)
     if not token:
         return None
-    # Acepta token en formato "Bearer <token>" o token plano
-    if token.lower().startswith("bearer "):
-        token = token.split(" ", 1)[1].strip()
     try:
-        data = jwt.decode(
-            token,
-            JWT_SECRET,
-            algorithms=[JWT_ALG],
-            options={"verify_exp": True, "verify_nbf": True, "verify_iat": False},
-            leeway=120,
-        )
-        return data
-    except jwt.PyJWTError as e:
-        current_app.logger.warning("JWT error: %s", e)
+        data = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], options={"require": ["exp", "iat"]})
+        return data  # {"sub","role","warehouses",...}
+    except jwt.PyJWTError:
         return None
 
+def _make_token(username: str, role: str, warehouses: List[str]) -> str:
+    now = int(time.time())
+    exp = now + JWT_TTL_HOURS * 3600
+    payload = {
+        "iss": JWT_ISSUER,
+        "sub": username,
+        "role": role,
+        "warehouses": warehouses,
+        "iat": now,
+        "nbf": now - 60,
+        "exp": exp,
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 def require_auth(fn):
+    """Decorator para proteger endpoints con JWT. Inyecta request._user"""
     @wraps(fn)
-    def wrapper(*args, **kwargs):
-        if not JWT_SECRET:
-            return jsonify({"error": {"code": "CONFIG", "message": "Falta JWT_SECRET"}}), 500
-        # Verificar cookie primero, luego header Authorization
-        token = request.cookies.get("token") or request.headers.get("Authorization")
-        user = decode_token(token)
+    def _wrap(*args, **kwargs):
+        user = decode_token(request.headers.get("Authorization"))
         if not user:
             return jsonify({"error": {"code": "UNAUTHORIZED", "message": "Token inválido o ausente"}}), 401
         request._user = user
         return fn(*args, **kwargs)
-    return wrapper
+    return _wrap
 
+def user_can_access_whs(whs: str) -> bool:
+    """Usado por recepciones_api.py para validar acceso al almacén."""
+    user = getattr(request, "_user", None) or decode_token(request.headers.get("Authorization"))
+    if not user:
+        return False
+    return whs in (user.get("warehouses") or [])
 
-def login_required(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        token = request.cookies.get("token")
-        user = decode_token(token)
-        if not user:
-            return redirect("/login")
-        request._user = user
-        return fn(*args, **kwargs)
-    return wrapper
-
-
-@bp_auth.get("/login")
-def login_form():
-    token = request.cookies.get("token")
-    if token and decode_token(token):
-        # Ya autenticado, redirigir a admin
-        return redirect("/admin")
-    return render_template("login.html")
-
-
+# -----------------------------------------------------------------------------
+# Login / Logout / Me
+# -----------------------------------------------------------------------------
 @bp_auth.post("/login")
 def login():
-    if not DB_URL or not JWT_SECRET:
-        return jsonify({"error": {"code": "CONFIG", "message": "Falta DATABASE_URL o JWT_SECRET"}}), 500
-
-    # Obtener credenciales de JSON o formulario
-    if request.is_json:
-        data = request.get_json(silent=True) or {}
-        username = (data.get("username") or "").strip()
-        password = data.get("password") or ""
-    else:
-        username = (request.form.get("username") or "").strip()
-        password = request.form.get("password") or ""
+    """
+    Body JSON: { "username":"...", "password":"..." }
+    Respuesta: { username, role, warehouses, token }
+    """
+    body = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    password = body.get("password") or ""
 
     if not username or not password:
         return jsonify({"error": {"code": "VALIDATION", "message": "username y password son requeridos"}}), 400
 
-    # Validar contra DB
+    # 1) Buscar usuario
     with _db() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(
-            "SELECT username, password AS hashed, role, active "
-            "FROM users WHERE username=%s",
-            (username,),
-        )
-        u = cur.fetchone()
-        if not u or not u.get("active", True):
-            return jsonify({"error": {"code": "INVALID_CREDENTIALS", "message": "Credenciales inválidas"}}), 401
+        cur.execute("SELECT username, password, role, active FROM users WHERE username=%s", (username,))
+        row = cur.fetchone()
 
-        try:
-            ph.verify(u["hashed"], password)
-        except (VerifyMismatchError, InvalidHashError):
-            return jsonify({"error": {"code": "INVALID_CREDENTIALS", "message": "Credenciales inválidas"}}), 401
+    if not row or not row["active"]:
+        return jsonify({"error": {"code": "AUTH", "message": "Credenciales inválidas o usuario inactivo"}}), 401
 
-        # Obtener almacenes del usuario
+    stored = row["password"] or ""
+    ok = False
+    try:
+        # Caso 1: es hash Argon2
+        if stored.startswith("$argon2"):
+            ph.verify(stored, password)
+            ok = True
+            # rehash si cambian parámetros
+            if ph.check_needs_rehash(stored):
+                new_hash = ph.hash(password)
+                with _db() as conn, conn.cursor() as cur:
+                    cur.execute("UPDATE users SET password=%s WHERE username=%s", (new_hash, username))
+                    conn.commit()
+        else:
+            # Caso 2: guardado plano (temporal) -> aceptamos una vez y re-hasheamos
+            if stored == password:
+                ok = True
+                new_hash = ph.hash(password)
+                with _db() as conn, conn.cursor() as cur:
+                    cur.execute("UPDATE users SET password=%s WHERE username=%s", (new_hash, username))
+                    conn.commit()
+    except (VerifyMismatchError, InvalidHashError):
+        ok = False
+
+    if not ok:
+        return jsonify({"error": {"code": "AUTH", "message": "Credenciales inválidas"}}), 401
+
+    # 2) Warehouses
+    with _db() as conn, conn.cursor() as cur:
         cur.execute("SELECT whscode FROM user_warehouses WHERE username=%s", (username,))
-        whs = [r["whscode"] for r in cur.fetchall()]
+        whs_rows = [r[0] for r in cur.fetchall()]
 
-    token = _make_token({"username": username, "role": u["role"], "warehouses": whs})
+    role = row["role"] or "user"
+    token = _make_token(username, role, whs_rows)
 
-    # Set JWT en cookie HttpOnly
-    resp = make_response(redirect("/admin"))
-    secure = current_app.config.get("SESSION_COOKIE_SECURE", True)
-    http_only = current_app.config.get("SESSION_COOKIE_HTTPONLY", True)
-    same_site = current_app.config.get("SESSION_COOKIE_SAMESITE", "Lax")
-    resp.set_cookie("token", token, httponly=http_only, secure=secure, samesite=same_site)
-    return resp
+    return jsonify({
+        "username": username,
+        "role": role,
+        "warehouses": whs_rows,
+        "token": token
+    }), 200
 
+@bp_auth.get("/me")
+@require_auth
+def me():
+    """Devuelve las claims del JWT (útil para debug/UI)."""
+    return jsonify({"user": getattr(request, "_user", {})})
 
-@bp_auth.get("/logout")
+@bp_auth.post("/logout")
 def logout():
-    resp = make_response(redirect("/login"))
-    resp.delete_cookie("token")
-    return resp
+    """
+    No hay invalidación server-side con JWT. El cliente debe borrar el token.
+    Se responde 200 por conveniencia.
+    """
+    return jsonify({"ok": True})
