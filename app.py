@@ -3,13 +3,13 @@ import os
 import logging
 from datetime import timedelta
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, render_template
 from flask_cors import CORS
 from flask_talisman import Talisman
 from dotenv import load_dotenv
 
 # Blueprints (asegúrate de que existan estos módulos)
-from auth import bp_auth               # url_prefix="/api" en auth.py
+from auth import bp_auth               # url_prefix="/api"
 from recepciones_api import bp_recepciones  # url_prefix="/api"
 from admin import bp_admin_api, bp_admin_ui  # "/api/admin" y "/admin"
 
@@ -36,7 +36,6 @@ def _make_app_config(app: Flask):
     secret = os.getenv("SECRET_KEY")
     if not secret:
         raise RuntimeError("SECRET_KEY no está configurada (env)")
-
     app.secret_key = secret
 
     # Cookies seguras (ya que desplegamos en HTTPS en Render)
@@ -139,30 +138,24 @@ def create_app() -> Flask:
         return jsonify({"error": {"code": "UNEXPECTED_ERROR", "message": str(e)}}), 500
 
     # ---------------- Blueprints ----------------
-    # ¡Importante! Los nombres internos de los blueprints deben ser únicos.
-    # En los archivos:
-    #   - auth.py           -> bp_auth = Blueprint("auth_api", __name__, url_prefix="/api")
-    #   - recepciones_api.py-> bp_recepciones = Blueprint("recepciones", __name__, url_prefix="/api")
-    #   - admin.py          -> bp_admin_api = Blueprint("admin_api", __name__, url_prefix="/api/admin")
-    #                          bp_admin_ui  = Blueprint("admin_ui",  __name__)
     app.register_blueprint(bp_auth)
     app.register_blueprint(bp_recepciones)
     app.register_blueprint(bp_admin_api)
     app.register_blueprint(bp_admin_ui)
 
+    # ---------------- Ruta raíz (login) ----------------
+    @app.get("/")
+    def index_page():
+        # Sirve la página de login (templates/index.html)
+        return render_template("index.html")
+
     app.logger.info("App lista. CORS_ORIGINS=%s", _get_allowed_origins())
     return app
 
-# -----------------------------------------------------------------------------
 # App global (para Gunicorn con wsgi:app)
-# -----------------------------------------------------------------------------
 app = create_app()
 
-# -----------------------------------------------------------------------------
 # Dev server
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Para desarrollo local
     port = int(os.getenv("PORT", "5000"))
-    # ssl_context='adhoc' solo si quieres https local; normalmente no hace falta
     app.run(host="127.0.0.1", port=port, debug=True)
