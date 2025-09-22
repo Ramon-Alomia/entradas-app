@@ -1,5 +1,5 @@
 // static/admin.js
-// Endpoints JSON ahora viven bajo /admin/* (sin /api/admin)
+// API JSON vive bajo /admin/*
 const API_BASE = "/admin";
 
 /* ---------------- Utils ---------------- */

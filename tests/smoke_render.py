@@ -14,8 +14,8 @@ def main():
     base = args.base.rstrip("/")
 
     # 1) LOGIN
-    print(f"[1] POST {base}/api/login")
-    r = requests.post(f"{base}/api/login", json={"username": args.user, "password": args.password}, timeout=60)
+    print(f"[1] POST {base}/login")
+    r = requests.post(f"{base}/login", json={"username": args.user, "password": args.password}, timeout=60)
     print("   status:", r.status_code)
     if r.status_code != 200:
         print("   body:", r.text)
@@ -31,19 +31,19 @@ def main():
     # Debug: muestra 20 chars del token
     print("   hdr Authorization:", f"Bearer {token[:20]}...")
 
-    # 2) /api/me (opcional, confirma que el token se acepta)
-    print(f"[2] GET  {base}/api/me")
-    r = requests.get(f"{base}/api/me", headers=headers, timeout=60)
+    # 2) /me (opcional, confirma que el token se acepta)
+    print(f"[2] GET  {base}/me")
+    r = requests.get(f"{base}/me", headers=headers, timeout=60)
     print("   status:", r.status_code)
     print("   body:", r.text[:300])
     if r.status_code != 200:
-        print("   ❌ El token no fue aceptado en /api/me")
+        print("   ❌ El token no fue aceptado en /me")
         sys.exit(2)
 
-    # 3) /api/orders
-    print(f"[3] GET  {base}/api/orders")
+    # 3) /orders
+    print(f"[3] GET  {base}/orders")
     params = {"due_from": args.due_from, "due_to": args.due_to, "page": "1", "pageSize": "10"}
-    r = requests.get(f"{base}/api/orders", params=params, headers=headers, timeout=60)
+    r = requests.get(f"{base}/orders", params=params, headers=headers, timeout=60)
     print("   url:", r.url)
     print("   status:", r.status_code)
     print("   body:", r.text[:500])
@@ -54,8 +54,8 @@ def main():
     # 4) (opcional) si quieres probar detalle rápido:
     try:
         doc_entry = (r.json().get("data") or [])[0]["docEntry"]
-        print(f"[4] GET  {base}/api/orders/{doc_entry}")
-        detail_url = f"{base}/api/orders/{doc_entry}"
+        print(f"[4] GET  {base}/orders/{doc_entry}")
+        detail_url = f"{base}/orders/{doc_entry}"
         if args.whs:
             detail_url += f"?whsCode={args.whs}"
         r2 = requests.get(detail_url, headers=headers, timeout=60)

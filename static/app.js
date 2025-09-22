@@ -1,6 +1,6 @@
 // static/app.js
-// Backends de negocio siguen en /api (orders, receipts). Si los mueves, cambia API_BASE = ''.
-const API_BASE = "/api";
+// Endpoints principales viven en la raíz (/orders, /receipts, ...).
+const API_BASE = "";
 
 const state = {
   user: null,

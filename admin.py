@@ -51,7 +51,7 @@ def admin_page():
     return render_template("admin.html")
 
 
-# -------------------- API JSON (sin /api prefix) --------------------
+# -------------------- API JSON (/admin/* endpoints) --------------------
 bp_admin_api = Blueprint("admin_api", __name__, url_prefix="/admin")
 
 
