@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any, List
 
 import psycopg
 from psycopg.rows import dict_row
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, redirect
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, InvalidHashError
 import jwt  # PyJWT
@@ -34,8 +34,8 @@ def _db():
 # -----------------------------------------------------------------------------
 # Blueprint
 # -----------------------------------------------------------------------------
-# Mantenemos /api para no romper el frontend actual (app.js usa /api/login)
-bp_auth = Blueprint("auth", __name__, url_prefix="/api")
+# Blueprint sin prefijo: las rutas quedan /login, /logout, /me
+bp_auth = Blueprint("auth", __name__)
 
 # -----------------------------------------------------------------------------
 # Utils JWT
@@ -73,20 +73,74 @@ def _make_token(username: str, role: str, warehouses: List[str]) -> str:
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
+def _load_user_from_request(req) -> Optional[Dict[str, Any]]:
+    if req is None:
+        return None
+    user = getattr(req, "_user", None)
+    if user:
+        return user
+    auth_header = None
+    try:
+        auth_header = req.headers.get("Authorization")
+    except Exception:
+        auth_header = None
+    user = decode_token(auth_header)
+    if user:
+        return user
+    # Cookie HttpOnly "token"
+    try:
+        cookie_token = req.cookies.get("token")
+    except Exception:
+        cookie_token = None
+    if cookie_token:
+        user = decode_token(f"Bearer {cookie_token}")
+        if user:
+            return user
+    return None
+
+
 def require_auth(fn):
     """Decorator para proteger endpoints con JWT. Inyecta request._user"""
+
     @wraps(fn)
     def _wrap(*args, **kwargs):
-        user = decode_token(request.headers.get("Authorization"))
+        user = _load_user_from_request(request)
         if not user:
             return jsonify({"error": {"code": "UNAUTHORIZED", "message": "Token inválido o ausente"}}), 401
         request._user = user
         return fn(*args, **kwargs)
+
     return _wrap
 
-def user_can_access_whs(whs: str) -> bool:
+
+def login_required(fn):
+    """Protege vistas HTML que dependen de la cookie/token JWT."""
+
+    @wraps(fn)
+    def _wrap(*args, **kwargs):
+        user = _load_user_from_request(request)
+        if not user:
+            return redirect("/login")
+        request._user = user
+        return fn(*args, **kwargs)
+
+    return _wrap
+
+
+def user_can_access_whs(whs: str, request_or_header: Optional[Any] = None) -> bool:
     """Usado por recepciones_api.py para validar acceso al almacén."""
-    user = getattr(request, "_user", None) or decode_token(request.headers.get("Authorization"))
+    if not whs:
+        return False
+
+    if request_or_header is None:
+        user = _load_user_from_request(request)
+    elif hasattr(request_or_header, "headers"):
+        user = _load_user_from_request(request_or_header)
+    elif isinstance(request_or_header, str):
+        user = decode_token(request_or_header)
+    else:
+        user = None
+
     if not user:
         return False
     return whs in (user.get("warehouses") or [])

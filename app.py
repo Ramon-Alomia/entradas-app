@@ -3,15 +3,15 @@ import os
 import logging
 from datetime import timedelta
 
-from flask import Flask, jsonify, render_template, redirect, request
+from flask import Flask, jsonify, render_template
 from flask_cors import CORS
 from flask_talisman import Talisman
 from dotenv import load_dotenv
 
 # Blueprints
-from auth import bp_auth, decode_token          # auth expone /login, /logout, /me y decode_token
-from recepciones_api import bp_recepciones      # /api/orders, /api/receipts...
-from admin import bp_admin_api, bp_admin_ui     # /admin/* (UI) y /admin/* (JSON)
+from auth import bp_auth                       # /login, /logout, /me
+from recepciones_api import bp_recepciones     # /orders, /receipts, ...
+from admin import bp_admin_api, bp_admin_ui    # /admin (UI) y /admin/* (JSON)
 
 # -----------------------------------------------------------------------------#
 # Config helpers
@@ -55,11 +55,12 @@ def _set_security_headers(app: Flask):
         "font-src": ["'self'", "fonts.gstatic.com"],
         "img-src": ["'self'", "data:"],
     }
+    force_https = bool(os.getenv("RENDER")) and not app.config.get("TESTING", False)
     Talisman(
         app,
         content_security_policy=csp,
-        force_https=True,
-        strict_transport_security=True,
+        force_https=force_https,
+        strict_transport_security=force_https,
         strict_transport_security_max_age=31536000,
     )
 
@@ -70,7 +71,14 @@ def _enable_cors(app: Flask):
         return
     CORS(
         app,
-        resources={r"/api/*": {"origins": origins}},
+        resources={
+            r"/admin/.*": {"origins": origins},
+            r"/orders(?:/.*)?": {"origins": origins},
+            r"/receipts": {"origins": origins},
+            r"/login": {"origins": origins},
+            r"/logout": {"origins": origins},
+            r"/me": {"origins": origins},
+        },
         supports_credentials=False,
         methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
@@ -91,6 +99,12 @@ def create_app() -> Flask:
         static_folder="static",
         template_folder="templates",
     )
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        app.config["TESTING"] = True
+
+    if app.config.get("TESTING"):
+        app.testing = True
 
     # Logging básico
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -133,25 +147,14 @@ def create_app() -> Flask:
         return jsonify({"error": {"code": "UNEXPECTED_ERROR", "message": str(e)}}), 500
 
     # ---------------- Blueprints ----------------
-    app.register_blueprint(bp_auth)          # /login, /logout, /me (cookies HttpOnly)
-    app.register_blueprint(bp_recepciones)   # /api/orders, /api/receipts,...
-    app.register_blueprint(bp_admin_api)     # /admin JSON
+    app.register_blueprint(bp_auth)          # /login, /logout, /me
+    app.register_blueprint(bp_recepciones)   # /orders, /receipts, ...
+    app.register_blueprint(bp_admin_api)     # /admin/* JSON
     app.register_blueprint(bp_admin_ui)      # /admin UI
 
-    # ---------------- Raíz: redirige a /login si no hay sesión ----------------
+    # ---------------- Raíz: sirve la SPA principal ----------------
     @app.get("/")
     def root():
-        token = request.cookies.get("token")
-        user = None
-        if token:
-            try:
-                user = decode_token(token)
-            except Exception:
-                user = None
-        if not user:
-            # Sin sesión → ve al login (plantilla /login del blueprint auth)
-            return redirect("/login")
-        # Con sesión → sirve el dashboard (index.html)
         return render_template("index.html")
 
     app.logger.info("App lista. CORS_ORIGINS=%s", _get_allowed_origins())

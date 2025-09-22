@@ -106,7 +106,7 @@ def main():
             rows = cur.fetchall()
             print(f"✅ Consulta OK. Filas: {len(rows)}")
             if not rows:
-                print("ℹ️ No hay registros con ese filtro. Genera un POST /api/receipts y vuelve a correr este script.")
+                print("ℹ️ No hay registros con ese filtro. Genera un POST /receipts y vuelve a correr este script.")
                 return
 
             total_qty = 0
