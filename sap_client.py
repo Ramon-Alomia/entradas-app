@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import requests
 from requests import Response
-from requests.exceptions import SSLError, ConnectionError, Timeout
+from requests.exceptions import SSLError, ConnectionError, Timeout, HTTPError
 
 log = logging.getLogger("sap_client")
 
@@ -50,6 +50,9 @@ def _cookie_path_for_base(base: str) -> str:
 
 
 class SapClient:
+    _DATE_FORMATS = ("datetimeoffset", "datetime", "iso")
+    _preferred_date_format: Optional[str] = None
+
     def __init__(self) -> None:
         if not BASE_URL:
             raise RuntimeError("Falta SERVICE_LAYER_URL/SAP_SL_BASE_URL en el entorno")
@@ -69,6 +72,8 @@ class SapClient:
 
         log.info("SAP SL base=%s | verify=%s | cookie_path=%s", self.base, self.s.verify, self.cookie_path)
         self._session_id: Optional[str] = None
+        # Formato preferido para literales de fecha en filtros DocDueDate
+        self._date_format = SapClient._preferred_date_format or SapClient._DATE_FORMATS[0]
 
     # ------------------ sesión ------------------
     def login(self) -> None:
@@ -135,11 +140,49 @@ class SapClient:
 
     # ------------------ helpers ------------------
     @staticmethod
-    def _date_literal(d: Optional[str]) -> Optional[str]:
+    def _escape_single_quotes(value: str) -> str:
+        """Escapa comillas simples para evitar romper el $filter."""
+        return value.replace("'", "''")
+
+    @classmethod
+    def _format_date_literal(cls, date_str: str, fmt: str) -> str:
+        if fmt == "datetimeoffset":
+            return f"datetimeoffset'{date_str}T00:00:00Z'"
+        if fmt == "datetime":
+            return f"datetime'{date_str}T00:00:00'"
+        if fmt == "iso":
+            return f"{date_str}T00:00:00Z"
+        raise ValueError(f"Formato de fecha no soportado: {fmt}")
+
+    def _date_literal(self, d: Optional[str], fmt: Optional[str]) -> Optional[str]:
         if not d:
             return None
-        # Service Layer espera DateTime como datetime'YYYY-MM-DDTHH:MM:SS'
-        return f"datetime'{d}T00:00:00'"
+        if not fmt:
+            fmt = self._date_format
+        return self._format_date_literal(d, fmt)
+
+    def _build_filter(
+        self,
+        due_from: Optional[str],
+        due_to: Optional[str],
+        vendor: Optional[str],
+        whs: Optional[str],
+        fmt: Optional[str],
+    ) -> str:
+        filters: List[str] = ["DocumentStatus eq 'bost_Open'"]
+        if due_from:
+            filters.append(f"DocDueDate ge {self._date_literal(due_from, fmt)}")
+        if due_to:
+            filters.append(f"DocDueDate le {self._date_literal(due_to, fmt)}")
+        if vendor:
+            vendor_escaped = self._escape_single_quotes(vendor)
+            filters.append(f"CardCode eq '{vendor_escaped}'")
+        if whs:
+            whs_escaped = self._escape_single_quotes(whs)
+            filters.append(
+                "DocumentLines/any(d:d/WarehouseCode eq '{w}' and d/OpenQuantity gt 0)".format(w=whs_escaped)
+            )
+        return " and ".join(filters)
 
     # ------------------ endpoints ------------------
     def get_open_purchase_orders(
@@ -156,48 +199,79 @@ class SapClient:
         NOTA: Para rendimiento, aquí no calculamos totalOpenQty; se puede
         derivar en la vista detalle. (Se deja en None para UI.)
         """
-        filters: List[str] = ["DocumentStatus eq 'bost_Open'"]
-        if due_from:
-            filters.append(f"DocDueDate ge {self._date_literal(due_from)}")
-        if due_to:
-            filters.append(f"DocDueDate le {self._date_literal(due_to)}")
-        if vendor:
-            filters.append(f"CardCode eq '{vendor}'")
-        if whs:
-            filters.append("DocumentLines/any(d:d/WarehouseCode eq '{w}' and d/OpenQuantity gt 0)".format(w=whs))
-
-        filter_str = " and ".join(filters)
         top = max(1, min(int(page_size), 100))
         skip = max(0, (max(1, int(page)) - 1) * top)
 
-        params = {
+        base_params = {
             "$select": "DocEntry,DocNum,DocDueDate,CardCode,CardName",
-            "$filter": filter_str,
             "$count": "true",
             "$orderby": "DocDueDate asc,DocEntry asc",
             "$top": str(top),
             "$skip": str(skip),
         }
 
-        r = self._request("GET", "/PurchaseOrders", params=params)
-        payload = r.json()
-        total = int(payload.get("@odata.count", 0))
-        rows = payload.get("value", [])
+        date_filters_present = bool(due_from or due_to)
+        if date_filters_present:
+            seen: set[str] = set()
+            formats_to_try: List[Optional[str]] = []
+            for fmt in (self._date_format, *SapClient._DATE_FORMATS):
+                if fmt and fmt not in seen:
+                    formats_to_try.append(fmt)
+                    seen.add(fmt)
+        else:
+            formats_to_try = [None]
 
-        data = []
-        for it in rows:
-            data.append(
-                {
-                    "docEntry": it["DocEntry"],
-                    "docNum": it["DocNum"],
-                    "docDueDate": it.get("DocDueDate"),
-                    "vendorCode": it.get("CardCode"),
-                    "vendorName": it.get("CardName"),
-                    "openLines": None,      # opcional (no calculado aquí)
-                    "totalOpenQty": None,   # opcional (no calculado aquí)
-                }
-            )
-        return {"data": data, "page": int(page), "pageSize": top, "total": total}
+        last_error: Optional[HTTPError] = None
+        for idx, fmt in enumerate(formats_to_try):
+            params = dict(base_params)
+            params["$filter"] = self._build_filter(due_from, due_to, vendor, whs, fmt)
+
+            try:
+                r = self._request("GET", "/PurchaseOrders", params=params)
+            except HTTPError as exc:
+                last_error = exc
+                should_retry = (
+                    date_filters_present
+                    and exc.response is not None
+                    and exc.response.status_code == 400
+                    and idx + 1 < len(formats_to_try)
+                )
+                if should_retry:
+                    log.warning(
+                        "SAP rechazó filtro DocDueDate con formato '%s'; reintentando con '%s'",
+                        fmt,
+                        formats_to_try[idx + 1],
+                    )
+                    continue
+                raise
+
+            if date_filters_present and fmt:
+                self._date_format = fmt
+                SapClient._preferred_date_format = fmt
+
+            payload = r.json()
+            total = int(payload.get("@odata.count", 0))
+            rows = payload.get("value", [])
+
+            data = []
+            for it in rows:
+                data.append(
+                    {
+                        "docEntry": it["DocEntry"],
+                        "docNum": it["DocNum"],
+                        "docDueDate": it.get("DocDueDate"),
+                        "vendorCode": it.get("CardCode"),
+                        "vendorName": it.get("CardName"),
+                        "openLines": None,      # opcional (no calculado aquí)
+                        "totalOpenQty": None,   # opcional (no calculado aquí)
+                    }
+                )
+            return {"data": data, "page": int(page), "pageSize": top, "total": total}
+
+        if last_error:
+            raise last_error
+
+        return {"data": [], "page": int(page), "pageSize": top, "total": 0}
 
     def get_purchase_order(self, doc_entry: int, whs: Optional[str]) -> Dict[str, Any]:
         """
