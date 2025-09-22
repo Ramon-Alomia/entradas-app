@@ -178,10 +178,9 @@ class SapClient:
             vendor_escaped = self._escape_single_quotes(vendor)
             filters.append(f"CardCode eq '{vendor_escaped}'")
         if whs:
-            whs_escaped = self._escape_single_quotes(whs)
-            filters.append(
-                "DocumentLines/any(d:d/WarehouseCode eq '{w}' and d/OpenQuantity gt 0)".format(w=whs_escaped)
-            )
+            # Nota: El Service Layer de SAP B1 no soporta operadores lambda (any/all) en $filter.
+            # El filtrado por almacén se manejará con $expand + $filter en DocumentLines y post-procesamiento en Python.
+            pass
         return " and ".join(filters)
 
     # ------------------ endpoints ------------------
@@ -196,6 +195,9 @@ class SapClient:
     ) -> Dict[str, Any]:
         """
         Lista OCs abiertas con alguna línea abierta en el almacén solicitado.
+        El Service Layer no soporta filtros lambda (any/all), por lo que cuando se
+        especifica un almacén se usa $expand con $filter en DocumentLines y luego
+        se descartan en Python las órdenes sin líneas correspondientes.
         NOTA: Para rendimiento, aquí no calculamos totalOpenQty; se puede
         derivar en la vista detalle. (Se deja en None para UI.)
         """
@@ -225,6 +227,15 @@ class SapClient:
         for idx, fmt in enumerate(formats_to_try):
             params = dict(base_params)
             params["$filter"] = self._build_filter(due_from, due_to, vendor, whs, fmt)
+            # Si se filtra por almacén, usar $expand sobre DocumentLines con filtro
+            if whs:
+                whs_escaped = self._escape_single_quotes(whs)
+                params["$expand"] = (
+                    "DocumentLines("
+                    f"$filter=WarehouseCode eq '{whs_escaped}' and OpenQuantity gt 0;"
+                    "$select=LineNum,WarehouseCode,OpenQuantity)"
+                )
+                log.debug("Usando $expand filtrado de DocumentLines para whs=%s", whs)
 
             try:
                 r = self._request("GET", "/PurchaseOrders", params=params)
@@ -252,6 +263,14 @@ class SapClient:
             payload = r.json()
             total = int(payload.get("@odata.count", 0))
             rows = payload.get("value", [])
+            # Post-filtrado: si hay whs, conservar solo órdenes que tengan líneas expandidas
+            if whs:
+                rows = [
+                    o
+                    for o in rows
+                    if not isinstance(o.get("DocumentLines"), list)
+                    or o.get("DocumentLines")
+                ]
 
             data = []
             for it in rows:
