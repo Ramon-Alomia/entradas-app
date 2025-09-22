@@ -135,11 +135,11 @@ class SapClient:
 
     # ------------------ helpers ------------------
     @staticmethod
-    def _date_iso(d: Optional[str]) -> Optional[str]:
+    def _date_literal(d: Optional[str]) -> Optional[str]:
         if not d:
             return None
-        # 'YYYY-MM-DD' -> 'YYYY-MM-DDT00:00:00Z'
-        return f"{d}T00:00:00Z"
+        # Service Layer espera DateTime como datetime'YYYY-MM-DDTHH:MM:SS'
+        return f"datetime'{d}T00:00:00'"
 
     # ------------------ endpoints ------------------
     def get_open_purchase_orders(
@@ -158,9 +158,9 @@ class SapClient:
         """
         filters: List[str] = ["DocumentStatus eq 'bost_Open'"]
         if due_from:
-            filters.append(f"DocDueDate ge {self._date_iso(due_from)}")
+            filters.append(f"DocDueDate ge {self._date_literal(due_from)}")
         if due_to:
-            filters.append(f"DocDueDate le {self._date_iso(due_to)}")
+            filters.append(f"DocDueDate le {self._date_literal(due_to)}")
         if vendor:
             filters.append(f"CardCode eq '{vendor}'")
         if whs:
