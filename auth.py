@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any, List
 
 import psycopg
 from psycopg.rows import dict_row
-from flask import Blueprint, request, jsonify, redirect
+from flask import Blueprint, request, jsonify, redirect, render_template
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, InvalidHashError
 import jwt  # PyJWT
@@ -30,6 +30,26 @@ ph = PasswordHasher()
 
 def _db():
     return psycopg.connect(DB_URL)
+
+
+def _set_jwt_cookie(resp, token: str):
+    """Configura la cookie HttpOnly donde viaja el JWT."""
+    secure_cookie = bool(os.getenv("RENDER")) or request.is_secure
+    resp.set_cookie(
+        "token",
+        token,
+        httponly=True,
+        secure=secure_cookie,
+        samesite="Lax",
+        max_age=JWT_TTL_HOURS * 3600,
+        path="/",
+    )
+    return resp
+
+
+def _clear_jwt_cookie(resp):
+    resp.delete_cookie("token", path="/")
+    return resp
 
 # -----------------------------------------------------------------------------
 # Blueprint
@@ -148,6 +168,14 @@ def user_can_access_whs(whs: str, request_or_header: Optional[Any] = None) -> bo
 # -----------------------------------------------------------------------------
 # Login / Logout / Me
 # -----------------------------------------------------------------------------
+@bp_auth.get("/login")
+def login_page():
+    """Renderiza el formulario de inicio de sesión."""
+    if _load_user_from_request(request):
+        return redirect("/")
+    return render_template("login.html")
+
+
 @bp_auth.post("/login")
 def login():
     """
@@ -204,12 +232,15 @@ def login():
     role = row["role"] or "user"
     token = _make_token(username, role, whs_rows)
 
-    return jsonify({
+    response = jsonify({
         "username": username,
         "role": role,
         "warehouses": whs_rows,
         "token": token
-    }), 200
+    })
+    _set_jwt_cookie(response, token)
+    response.status_code = 200
+    return response
 
 @bp_auth.get("/me")
 @require_auth
@@ -217,10 +248,19 @@ def me():
     """Devuelve las claims del JWT (útil para debug/UI)."""
     return jsonify({"user": getattr(request, "_user", {})})
 
+@bp_auth.get("/logout")
+def logout_page():
+    resp = redirect("/login")
+    return _clear_jwt_cookie(resp)
+
+
 @bp_auth.post("/logout")
 def logout():
     """
     No hay invalidación server-side con JWT. El cliente debe borrar el token.
     Se responde 200 por conveniencia.
     """
-    return jsonify({"ok": True})
+    resp = jsonify({"ok": True})
+    _clear_jwt_cookie(resp)
+    resp.status_code = 200
+    return resp
