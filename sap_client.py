@@ -61,6 +61,7 @@ class SapClient:
 
         self.base = BASE_URL
         self.cookie_path = _cookie_path_for_base(self.base)
+        self.logger = log
 
         self.s = requests.Session()
         self.s.headers.update({
@@ -179,7 +180,7 @@ class SapClient:
             filters.append(f"CardCode eq '{vendor_escaped}'")
         if whs:
             # Nota: El Service Layer de SAP B1 no soporta operadores lambda (any/all) en $filter.
-            # El filtrado por almacén se manejará con $expand + $filter en DocumentLines y post-procesamiento en Python.
+            # El filtrado por almacén se resuelve en Python tras expandir DocumentLines.
             pass
         return " and ".join(filters)
 
@@ -195,12 +196,14 @@ class SapClient:
     ) -> Dict[str, Any]:
         """
         Lista OCs abiertas con alguna línea abierta en el almacén solicitado.
-        El Service Layer no soporta filtros lambda (any/all), por lo que cuando se
-        especifica un almacén se usa $expand con $filter en DocumentLines y luego
-        se descartan en Python las órdenes sin líneas correspondientes.
+        El Service Layer no soporta filtros lambda (any/all) ni $filter dentro de
+        $expand en subcolecciones, por lo que cuando se especifica un almacén se
+        expanden todas las líneas y el filtrado se hace en Python.
         NOTA: Para rendimiento, aquí no calculamos totalOpenQty; se puede
         derivar en la vista detalle. (Se deja en None para UI.)
         """
+        # UX: la paginación y el contador provienen del servidor y pueden no
+        # coincidir con la cantidad visible tras el filtrado de líneas en Python.
         top = max(1, min(int(page_size), 100))
         skip = max(0, (max(1, int(page)) - 1) * top)
 
@@ -227,15 +230,13 @@ class SapClient:
         for idx, fmt in enumerate(formats_to_try):
             params = dict(base_params)
             params["$filter"] = self._build_filter(due_from, due_to, vendor, whs, fmt)
-            # Si se filtra por almacén, usar $expand sobre DocumentLines con filtro
+            # Si se filtra por almacén, expandir DocumentLines y filtrar luego en Python
             if whs:
-                whs_escaped = self._escape_single_quotes(whs)
-                params["$expand"] = (
-                    "DocumentLines("
-                    f"$filter=WarehouseCode eq '{whs_escaped}' and OpenQuantity gt 0;"
-                    "$select=LineNum,WarehouseCode,OpenQuantity)"
+                params["$expand"] = "DocumentLines($select=LineNum,WarehouseCode,OpenQuantity)"
+                self.logger.debug(
+                    "SL expand sin filtro; filtrado de líneas por almacén en Python: whs=%s",
+                    whs,
                 )
-                log.debug("Usando $expand filtrado de DocumentLines para whs=%s", whs)
 
             try:
                 r = self._request("GET", "/PurchaseOrders", params=params)
@@ -265,12 +266,21 @@ class SapClient:
             rows = payload.get("value", [])
             # Post-filtrado: si hay whs, conservar solo órdenes que tengan líneas expandidas
             if whs:
-                rows = [
-                    o
-                    for o in rows
-                    if not isinstance(o.get("DocumentLines"), list)
-                    or o.get("DocumentLines")
-                ]
+                filtered_rows = []
+                for order in rows:
+                    doc_lines = order.get("DocumentLines") or []
+                    keep = [
+                        d
+                        for d in doc_lines
+                        if d.get("WarehouseCode") == whs
+                        and float(d.get("OpenQuantity") or 0) > 0
+                    ]
+                    if keep:
+                        # El Service Layer no soporta $filter dentro de $expand;
+                        # traemos todas las líneas y filtramos aquí.
+                        order["DocumentLines"] = keep
+                        filtered_rows.append(order)
+                rows = filtered_rows
 
             data = []
             for it in rows:
