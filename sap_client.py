@@ -20,7 +20,7 @@ log = logging.getLogger("sap_client")
 BASE_URL = (
     os.getenv("SAP_SL_BASE_URL")
     or os.getenv("SERVICE_LAYER_URL")
-    or ""
+    or "https://hwvdvsbo04.virtualdv.cloud:50000/b1s/v1"
 ).rstrip("/")
 
 COMPANY_DB  = os.getenv("COMPANY_DB")
@@ -147,13 +147,7 @@ class SapClient:
 
     @classmethod
     def _format_date_literal(cls, date_str: str, fmt: str) -> str:
-        if fmt == "datetimeoffset":
-            return f"datetimeoffset'{date_str}T00:00:00Z'"
-        if fmt == "datetime":
-            return f"datetime'{date_str}T00:00:00'"
-        if fmt == "iso":
-            return f"{date_str}T00:00:00Z"
-        raise ValueError(f"Formato de fecha no soportado: {fmt}")
+        return f"{date_str}T00:00:00Z"
 
     def _date_literal(self, d: Optional[str], fmt: Optional[str]) -> Optional[str]:
         if not d:
@@ -306,21 +300,21 @@ class SapClient:
         """
         Detalle de OC; si whs se envía, filtra líneas por ese almacén.
         """
-        if whs:
-            expand = (
-                "DocumentLines("
-                f"$filter=WarehouseCode eq '{whs}';"
-                "$select=LineNum,ItemCode,ItemDescription,Quantity,OpenQuantity,WarehouseCode)"
-            )
-        else:
-            expand = "DocumentLines($select=LineNum,ItemCode,ItemDescription,Quantity,OpenQuantity,WarehouseCode)"
-
-        params = {"$select": "DocEntry,DocNum,DocDueDate", "$expand": expand}
+        params = {
+            "$select": "DocEntry,DocNum,DocDueDate",
+            "$expand": "DocumentLines($select=LineNum,ItemCode,ItemDescription,Quantity,OpenQuantity,WarehouseCode)",
+        }
         r = self._request("GET", f"/PurchaseOrders({doc_entry})", params=params)
         o = r.json()
 
+        filtered_lines = [
+            d
+            for d in o.get("DocumentLines", [])
+            if not whs or (d.get("WarehouseCode") == whs and float(d.get("OpenQuantity") or 0) > 0)
+        ]
+
         lines_out = []
-        for d in (o.get("DocumentLines") or []):
+        for d in filtered_lines:
             qty = float(d.get("Quantity", 0) or 0)
             openq = float(d.get("OpenQuantity", 0) or 0)
             lines_out.append(
@@ -334,11 +328,12 @@ class SapClient:
                     "warehouseCode": d.get("WarehouseCode"),
                 }
             )
+        o["DocumentLines"] = lines_out
         return {
             "docEntry": o["DocEntry"],
             "docNum": o["DocNum"],
             "docDueDate": o.get("DocDueDate"),
-            "lines": lines_out,
+            "lines": o.get("DocumentLines", []),
         }
 
     def post_grpo(
